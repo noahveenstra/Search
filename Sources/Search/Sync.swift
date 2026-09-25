@@ -18,7 +18,6 @@ import WebKit
 // space's tabs wins, because closing a tab is a choice. An identical row
 // is left alone so two Macs don't hand the same tabs back and forth.
 
-@MainActor
 final class CloudSync: ObservableObject {
     static let shared = CloudSync()
 
@@ -27,7 +26,7 @@ final class CloudSync: ObservableObject {
         didSet {
             guard enabled != oldValue else { return }
             Store.settings.set(enabled, forKey: Self.enabledKey)
-            if enabled { schedule() }
+            if enabled { Task { @MainActor in CloudSync.shared.schedule() } }
         }
     }
 
@@ -42,6 +41,7 @@ final class CloudSync: ObservableObject {
         enabled = Store.settings.object(forKey: Self.enabledKey) as? Bool ?? true
     }
 
+    @MainActor
     func start(browser: Browser) {
         guard !started else { return }
         started = true
@@ -50,7 +50,7 @@ final class CloudSync: ObservableObject {
         Vault.shareAcrossDevices()
         NotificationCenter.default.addObserver(
             forName: NSApplication.didBecomeActiveNotification, object: nil, queue: .main
-        ) { _ in MainActor.assumeIsolated { CloudSync.shared.schedule() } }
+        ) { _ in Task { @MainActor in CloudSync.shared.schedule() } }
         schedule()
     }
 
@@ -65,6 +65,7 @@ final class CloudSync: ObservableObject {
 
     /// Quitting doesn't get the two-second wait. The session is already on
     /// disk; this only copies it up.
+    @MainActor
     func pushSessionsNow() {
         guard !Store.testing, enabled, let cloud = Self.cloudRoot() else { return }
         var state = State.load(Store.folder)
@@ -72,14 +73,23 @@ final class CloudSync: ObservableObject {
         state.save(Store.folder)
     }
 
-    private func schedule() {
+    @MainActor
+    private func schedule(after seconds: Double = 2) {
         guard enabled, !Store.testing else { return }
         wait?.cancel()
-        let work = DispatchWorkItem { [weak self] in self?.reconcile() }
+        let work = DispatchWorkItem { [weak self] in
+            Task { @MainActor in self?.reconcile() }
+        }
         wait = work
-        DispatchQueue.main.asyncAfter(deadline: .now() + 2, execute: work)
+        DispatchQueue.main.asyncAfter(deadline: .now() + seconds, execute: work)
     }
 
+    /// File copies used to run here, on the main thread. An iCloud file that
+    /// is not on this Mac yet makes that copy sleep inside the kernel until
+    /// the download finishes, and the window stops answering. The pass now
+    /// runs off to the side. A folder that is still in iCloud is not copied;
+    /// iCloud is asked to fetch it, and the pass tries again later.
+    @MainActor
     private func reconcile() {
         guard enabled, !Store.testing else { return }
         guard !working else { again = true; return }
@@ -88,9 +98,21 @@ final class CloudSync: ObservableObject {
             return
         }
         working = true
-        var state = State.load(Store.folder)
-        let changed = Self.exchange(local: Store.folder, cloud: cloud, device: Self.deviceID, state: &state, browser: browser)
-        state.save(Store.folder)
+        let local = Store.folder
+        let device = Self.deviceID
+        let jars = browser.map(Self.jarIDs) ?? []
+        DispatchQueue.global(qos: .utility).async {
+            var state = State.load(local)
+            let changed = Self.exchange(local: local, cloud: cloud, device: device, state: &state, jars: jars)
+            state.save(local)
+            Task { @MainActor in
+                CloudSync.shared.finish(changed, cloud: cloud)
+            }
+        }
+    }
+
+    @MainActor
+    private func finish(_ changed: Changed, cloud: URL) {
         if changed.history { browser?.history.reload() }
         if changed.bookmarks { browser?.bookmarks.reload() }
         if changed.hidden { browser?.curtain.reload() }
@@ -101,14 +123,25 @@ final class CloudSync: ObservableObject {
         if changed.logins { browser?.relist() }
         let jars = changed.cookies
         Task { await Self.syncCookieJars(pull: jars, cloud: cloud) }
-        detail = Self.describe(cloud: cloud)
-        if changed.passwordKeyMissing {
-            detail += " Saved passwords are waiting for iCloud Keychain."
+        if changed.paused {
+            detail = "iCloud is still downloading some of this browser's files. Search will pick them up when they arrive."
+        } else {
+            detail = Self.describe(cloud: cloud)
+            if changed.passwordKeyMissing {
+                detail += " Saved passwords are waiting for iCloud Keychain."
+            }
         }
         working = false
-        if again { again = false; schedule() }
+        if changed.paused {
+            again = false
+            schedule(after: 30)
+        } else if again {
+            again = false
+            schedule()
+        }
     }
 
+    @MainActor
     private func apply(_ body: PrefBody) {
         guard let browser else { return }
         if browser.prefs.usesSpaces != body.spaces { browser.prefs.usesSpaces = body.spaces }
@@ -176,18 +209,31 @@ final class CloudSync: ObservableObject {
         var cookies: [String] = []
         var logins = false
         var passwordKeyMissing = false
+        /// A file was still only in iCloud, so this pass left it alone.
+        var paused = false
     }
 
-    /// `browser` is nil in the check that runs without opening a window.
+    /// Set for the duration of one pass when a file was left in iCloud.
+    /// One pass runs at a time.
+    private static var cloudPaused = false
+
+    /// `jars` is empty in the check that runs without opening a window.
+    /// Those ids are the space ids whose cookie files should be looked at.
+    /// The window's own objects stay on the main thread.
     @discardableResult
-    static func exchange(local: URL, cloud: URL, device: String, state: inout State, browser: Browser?) -> Changed {
+    static func exchange(local: URL, cloud: URL, device: String, state: inout State, jars: [String] = []) -> Changed {
+        cloudPaused = false
         var changed = Changed()
         try? FileManager.default.createDirectory(at: local, withIntermediateDirectories: true)
         let name = Host.current().localizedName ?? "Mac"
         let cardURL = cloud.appendingPathComponent("devices/\(device).json")
-        let card = decode(DeviceCard.self, cardURL)
-        if card?.name != name || (card?.seen.timeIntervalSinceNow ?? -999) < -60 {
-            put(encode(DeviceCard(name: name, seen: Date())), cardURL)
+        if stillInCloud(cardURL) {
+            notePaused(cardURL)
+        } else {
+            let card = decode(DeviceCard.self, cardURL)
+            if card?.name != name || (card?.seen.timeIntervalSinceNow ?? -999) < -60 {
+                put(encode(DeviceCard(name: name, seen: Date())), cardURL)
+            }
         }
 
         if let body = mergePrefs(local: local, cloud: cloud, device: device, state: &state) {
@@ -200,12 +246,13 @@ final class CloudSync: ObservableObject {
         changed.hidden = mergeHidden(local: local, cloud: cloud, device: device, state: &state)
         changed.extensions = mergeExtensions(local: local, cloud: cloud, state: &state)
         changed.sessions = mergeSessions(local: local, cloud: cloud, device: device, state: &state)
-        if browser != nil {
-            changed.cookies = mergeCookies(local: local, cloud: cloud, device: device, state: &state)
+        if !jars.isEmpty {
+            changed.cookies = mergeCookies(jars: jars, cloud: cloud, device: device, state: &state)
             let passwords = mergePasswords(cloud: cloud, state: &state)
             changed.logins = passwords.changed
             changed.passwordKeyMissing = passwords.waiting
         }
+        changed.paused = cloudPaused
         return changed
     }
 
@@ -241,6 +288,7 @@ final class CloudSync: ObservableObject {
     private static func mergeHistory(local: URL, cloud: URL, device: String, state: inout State) -> Bool {
         let file = local.appendingPathComponent("history.json")
         let remoteURL = cloud.appendingPathComponent("history.json")
+        if stillInCloud(remoteURL) { notePaused(remoteURL); return false }
         if FileManager.default.fileExists(atPath: file.path), decode([Visit].self, file) == nil { return false }
         let localVisits = decode([Visit].self, file) ?? []
         let remote = decode(Marked<[Visit]>.self, remoteURL)
@@ -314,6 +362,7 @@ final class CloudSync: ObservableObject {
     private static func mergeBookmarks(local: URL, cloud: URL, device: String, state: inout State) -> Bool {
         let file = local.appendingPathComponent("bookmarks.json")
         let remoteURL = cloud.appendingPathComponent("bookmarks.json")
+        if stillInCloud(remoteURL) { notePaused(remoteURL); return false }
         if FileManager.default.fileExists(atPath: file.path), decode([Bookmark].self, file) == nil { return false }
         let localMarks = decode([Bookmark].self, file) ?? []
         let remote = decode(Marked<[Bookmark]>.self, remoteURL)
@@ -360,6 +409,7 @@ final class CloudSync: ObservableObject {
     private static func mergeSpaces(local: URL, cloud: URL, device: String, state: inout State) -> Bool {
         let file = local.appendingPathComponent("spaces.json")
         let remoteURL = cloud.appendingPathComponent("spaces.json")
+        if stillInCloud(remoteURL) { notePaused(remoteURL); return false }
         let localSpaces = decode([Space].self, file) ?? []
         let remote = decode(Marked<[Space]>.self, remoteURL)
         var gone = remote?.gone ?? [:]
@@ -404,6 +454,7 @@ final class CloudSync: ObservableObject {
     private static func mergeHidden(local: URL, cloud: URL, device: String, state: inout State) -> Bool {
         let file = local.appendingPathComponent("hidden.json")
         let remoteURL = cloud.appendingPathComponent("hidden.json")
+        if stillInCloud(remoteURL) { notePaused(remoteURL); return false }
         let localRows = decode([String: [VeilRow]].self, file) ?? [:]
         let remote = decode(Marked<[String: [VeilRow]]>.self, remoteURL)
         var gone = remote?.gone ?? [:]
@@ -473,6 +524,7 @@ final class CloudSync: ObservableObject {
     private static func mergePrefs(local: URL, cloud: URL, device: String, state: inout State) -> PrefBody? {
         let file = local.appendingPathComponent("prefs-sync.json")
         let remoteURL = cloud.appendingPathComponent("prefs.json")
+        if stillInCloud(remoteURL) { notePaused(remoteURL); return nil }
         let neverNow = (Store.settings.stringArray(forKey: Vault.neverKey) ?? []).sorted()
         let current = PrefBody(
             spaces: Store.settings.bool(forKey: "spaces"),
@@ -539,6 +591,7 @@ final class CloudSync: ObservableObject {
         for deviceFolder in devices {
             guard let files = try? FileManager.default.contentsOfDirectory(at: deviceFolder, includingPropertiesForKeys: nil) else { continue }
             for file in files {
+                if stillInCloud(file) { notePaused(file); continue }
                 guard let session = decode(RemoteSession.self, file) else { continue }
                 byName[file.lastPathComponent, default: []].append(session)
             }
@@ -634,6 +687,7 @@ final class CloudSync: ObservableObject {
         let source = local.appendingPathComponent("Extensions", isDirectory: true)
         let dest = cloud.appendingPathComponent("Extensions", isDirectory: true)
         let bookURL = cloud.appendingPathComponent("extensions.json")
+        if stillInCloud(bookURL) { notePaused(bookURL); return false }
         let localInstalled = readInstalled(source)
         let remoteInstalled = readInstalled(dest)
         let book = decode(ExtensionBook.self, bookURL)
@@ -659,7 +713,7 @@ final class CloudSync: ObservableObject {
             }
             localNotes[id] = ExtensionNote(hash: hash, updated: updated, record: record)
         }
-        var remoteNotes = book?.notes ?? [:]
+        var remoteNotes = book?.notes.filter { isExtensionFolder($0.key) } ?? [:]
         for id in extensionIDs(in: dest) where remoteNotes[id] == nil {
             let folder = dest.appendingPathComponent(id, isDirectory: true)
             let folderDate = (try? folder.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? .distantPast
@@ -682,14 +736,30 @@ final class CloudSync: ObservableObject {
                 }
                 try? FileManager.default.removeItem(at: dest.appendingPathComponent(id))
             case .local:
-                copyFolder(id, from: source, to: dest)
-                if let note = localNotes[id] { notes[id] = note }
-                if let record = localInstalled[id] ?? remoteInstalled[id] { records[id] = record }
+                let folder = dest.appendingPathComponent(id, isDirectory: true)
+                let same = remoteNotes[id]?.hash == localNotes[id]?.hash
+                    && FileManager.default.fileExists(atPath: folder.path)
+                if same || copyFolder(id, from: source, to: dest) {
+                    if let note = localNotes[id] { notes[id] = note }
+                    if let record = localInstalled[id] ?? remoteInstalled[id] { records[id] = record }
+                } else {
+                    cloudPaused = true
+                    if let note = remoteNotes[id] { notes[id] = note }
+                    if let record = remoteInstalled[id] ?? localInstalled[id] { records[id] = record }
+                }
             case .remote:
-                copyFolder(id, from: dest, to: source)
-                changed = true
-                if let note = remoteNotes[id] { notes[id] = note }
-                if let record = remoteInstalled[id] ?? localInstalled[id] { records[id] = record }
+                let folder = source.appendingPathComponent(id, isDirectory: true)
+                let same = localNotes[id]?.hash == remoteNotes[id]?.hash
+                    && FileManager.default.fileExists(atPath: folder.path)
+                if same || copyFolder(id, from: dest, to: source) {
+                    if !same { changed = true }
+                    if let note = remoteNotes[id] { notes[id] = note }
+                    if let record = remoteInstalled[id] ?? localInstalled[id] { records[id] = record }
+                } else {
+                    cloudPaused = true
+                    if let note = localNotes[id] { notes[id] = note }
+                    if let record = localInstalled[id] { records[id] = record }
+                }
             }
         }
         let list = records.values.sorted { $0.name < $1.name }
@@ -712,7 +782,7 @@ final class CloudSync: ObservableObject {
         ) else { return [] }
         return urls.compactMap { url in
             let name = url.lastPathComponent
-            guard !name.hasPrefix("."), name != "installed.json" else { return nil }
+            guard isExtensionFolder(name) else { return nil }
             var directory: ObjCBool = false
             guard FileManager.default.fileExists(atPath: url.path, isDirectory: &directory), directory.boolValue else { return nil }
             return name
@@ -727,19 +797,61 @@ final class CloudSync: ObservableObject {
         return out
     }
 
-    private static func copyFolder(_ id: String, from root: URL, to destRoot: URL) {
+    /// Chrome's own id: 32 letters, a through p. iCloud names a conflict
+    /// "that id 2", and copying the conflict is what froze the window.
+    static func isExtensionFolder(_ name: String) -> Bool {
+        name.count == 32 && name.utf8.allSatisfy { $0 >= 97 && $0 <= 112 }
+    }
+
+    /// True when the file is an iCloud placeholder whose bytes are not
+    /// on this Mac. Reading or copying it waits inside the kernel.
+    static func stillInCloud(_ url: URL) -> Bool {
+        var directory: ObjCBool = false
+        guard FileManager.default.fileExists(atPath: url.path, isDirectory: &directory) else { return false }
+        let keys: Set<URLResourceKey> = [.isUbiquitousItemKey, .ubiquitousItemDownloadingStatusKey]
+        if let values = try? url.resourceValues(forKeys: keys),
+           values.isUbiquitousItem == true,
+           values.ubiquitousItemDownloadingStatus == .notDownloaded {
+            return true
+        }
+        guard directory.boolValue,
+              let enumerator = FileManager.default.enumerator(at: url, includingPropertiesForKeys: Array(keys))
+        else { return false }
+        for case let child as URL in enumerator {
+            guard let values = try? child.resourceValues(forKeys: keys),
+                  values.isUbiquitousItem == true,
+                  values.ubiquitousItemDownloadingStatus == .notDownloaded else { continue }
+            return true
+        }
+        return false
+    }
+
+    private static func notePaused(_ url: URL) {
+        try? FileManager.default.startDownloadingUbiquitousItem(at: url)
+        cloudPaused = true
+    }
+
+    @discardableResult
+    private static func copyFolder(_ id: String, from root: URL, to destRoot: URL) -> Bool {
         let source = root.appendingPathComponent(id, isDirectory: true)
-        guard FileManager.default.fileExists(atPath: source.path) else { return }
+        guard FileManager.default.fileExists(atPath: source.path) else { return false }
+        if stillInCloud(source) {
+            notePaused(source)
+            return false
+        }
         try? FileManager.default.createDirectory(at: destRoot, withIntermediateDirectories: true)
         let dest = destRoot.appendingPathComponent(id, isDirectory: true)
+        if FileManager.default.fileExists(atPath: dest.path), treeHash(dest) == treeHash(source) { return true }
         let temporary = destRoot.appendingPathComponent(".next-\(id)")
         try? FileManager.default.removeItem(at: temporary)
         do {
             try FileManager.default.copyItem(at: source, to: temporary)
             if FileManager.default.fileExists(atPath: dest.path) { try FileManager.default.removeItem(at: dest) }
             try FileManager.default.moveItem(at: temporary, to: dest)
+            return true
         } catch {
             try? FileManager.default.removeItem(at: temporary)
+            return false
         }
     }
 
@@ -796,23 +908,28 @@ final class CloudSync: ObservableObject {
 
     /// Writes each jar up and returns the space ids whose jar arrived newer
     /// from another Mac, for the caller to hand to WebKit.
-    private static func mergeCookies(local: URL, cloud: URL, device: String, state: inout State) -> [String] {
-        guard let browser = CloudSync.shared.browser else { return [] }
+    private static func mergeCookies(jars: [String], cloud: URL, device: String, state: inout State) -> [String] {
         var due: [String] = []
-        for (id, store) in jars(browser) {
+        for id in jars {
             let remoteURL = cloud.appendingPathComponent("cookies/\(id).json")
+            if stillInCloud(remoteURL) { notePaused(remoteURL); continue }
             let remote = decode(Marked<[Crumb]>.self, remoteURL)
             // The local jar is read asynchronously below; here we only notice
             // a remote jar we haven't applied. The push happens in pullCookies
             // once WebKit has answered, and again on the next pass.
             if let remote, remote.device != device, state.cookieSeen[id] != remote.updated {
                 due.append(id)
-                _ = store
             }
         }
         return due
     }
 
+    @MainActor
+    private static func jarIDs(_ browser: Browser) -> [String] {
+        jars(browser).map(\.0)
+    }
+
+    @MainActor
     private static func jars(_ browser: Browser) -> [(String, WKWebsiteDataStore)] {
         var out: [(String, WKWebsiteDataStore)] = [(Space.firstID.uuidString, WKWebsiteDataStore.default())]
         let sharing = Set(browser.spaces.filter { $0.sharesSignIns == true }.map(\.id))
@@ -822,11 +939,13 @@ final class CloudSync: ObservableObject {
         return out
     }
 
+    @MainActor
     private static func syncCookieJars(pull ids: [String], cloud: URL) async {
         await pullCookies(ids, cloud: cloud)
         await pushCookies(cloud: cloud, device: deviceID)
     }
 
+    @MainActor
     private static func pullCookies(_ ids: [String], cloud: URL) async {
         guard let browser = CloudSync.shared.browser else { return }
         let stores = Dictionary(uniqueKeysWithValues: jars(browser))
@@ -853,11 +972,13 @@ final class CloudSync: ObservableObject {
     }
 
     /// Called once a pass has the stores. Pushes the jars WebKit actually holds.
+    @MainActor
     static func pushCookies(cloud: URL, device: String) async {
         guard let browser = shared.browser, !Store.testing, shared.enabled else { return }
         var state = State.load(Store.folder)
         for (id, store) in jars(browser) {
             let remoteURL = cloud.appendingPathComponent("cookies/\(id).json")
+            if stillInCloud(remoteURL) { notePaused(remoteURL); continue }
             let remote = decode(Marked<[Crumb]>.self, remoteURL)
             let have = datedCrumbs(
                 await cookies(of: store), remote: remote?.body ?? [], marks: state.cookieMarks[id] ?? [:]
@@ -873,6 +994,7 @@ final class CloudSync: ObservableObject {
         state.save(Store.folder)
     }
 
+    @MainActor
     private static func cookies(of store: WKWebsiteDataStore) async -> [Crumb] {
         let found: [HTTPCookie] = await withCheckedContinuation { done in
             store.httpCookieStore.getAllCookies { done.resume(returning: $0) }
@@ -930,6 +1052,13 @@ final class CloudSync: ObservableObject {
         guard !Store.testing else { return PasswordResult() }
         let keyURL = cloud.appendingPathComponent("logins.key")
         let blobURL = cloud.appendingPathComponent("logins.bin")
+        if stillInCloud(keyURL) || stillInCloud(blobURL) {
+            if stillInCloud(keyURL) { notePaused(keyURL) }
+            if stillInCloud(blobURL) { notePaused(blobURL) }
+            var result = PasswordResult()
+            result.waiting = true
+            return result
+        }
         let cloudID = (try? String(contentsOf: keyURL, encoding: .utf8))?
             .trimmingCharacters(in: .whitespacesAndNewlines)
         var result = PasswordResult()
@@ -1139,12 +1268,10 @@ final class CloudSync: ObservableObject {
             try c.encode(extensionRecords, forKey: .extensionRecords)
         }
 
-        @MainActor
         static func load(_ folder: URL) -> State {
             decode(State.self, folder.appendingPathComponent("sync-state.json")) ?? State()
         }
 
-        @MainActor
         func save(_ folder: URL) {
             put(CloudSync.encode(self), folder.appendingPathComponent("sync-state.json"))
         }
@@ -1159,6 +1286,9 @@ final class CloudSync: ObservableObject {
     }
 
     static func decode<T: Decodable>(_ type: T.Type, _ url: URL) -> T? {
+        // A placeholder's bytes are not here. Data(contentsOf:) would wait
+        // in the kernel until iCloud produced them.
+        if stillInCloud(url) { notePaused(url); return nil }
         guard let data = try? Data(contentsOf: url) else { return nil }
         return try? JSONDecoder().decode(type, from: data)
     }
@@ -1226,8 +1356,8 @@ final class CloudSync: ObservableObject {
 
     // MARK: - the check
 
-    nonisolated static func selfTest() -> Bool {
-        MainActor.assumeIsolated { testSync() }
+    static func selfTest() -> Bool {
+        testSync()
     }
 
     private static func testSync() -> Bool {
@@ -1290,6 +1420,13 @@ final class CloudSync: ObservableObject {
         let onlyHere = ExtensionNote(hash: "3", updated: early, record: nil)
         let picked = chooseExtensions(local: ["both": noteEarly, "here": onlyHere], remote: ["both": noteLate], gone: [:])
         check(picked["both"] == .remote && picked["here"] == .local, "a newer extension wins and one only this Mac has is kept")
+        let realID = "aeblfdkhhhdcdjpifhhbdiojplfjncoa"
+        check(isExtensionFolder(realID), "a chrome extension id is a folder we sync")
+        check(!isExtensionFolder(realID + " 2") && !isExtensionFolder(".next-" + realID), "an iCloud conflict copy is not an extension")
+        let plain = FileManager.default.temporaryDirectory.appendingPathComponent("search-sync-plain-\(UUID().uuidString)")
+        try? Data("ok".utf8).write(to: plain)
+        check(!stillInCloud(plain), "a normal file is not treated as stuck in iCloud")
+        try? FileManager.default.removeItem(at: plain)
 
         let secret = SymmetricKey(size: .bits256)
         let book = LoginBook(rows: [extra], gone: [:])
@@ -1305,9 +1442,9 @@ final class CloudSync: ObservableObject {
         let drive = root.appendingPathComponent("cloud", isDirectory: true)
         put(encode([Visit(url: "https://from-a.example/", key: "from-a.example", title: "From A", count: 1, last: later)]), macA.appendingPathComponent("history.json"))
         var stateA = State()
-        _ = exchange(local: macA, cloud: drive, device: "mac-a", state: &stateA, browser: nil)
+        _ = exchange(local: macA, cloud: drive, device: "mac-a", state: &stateA)
         var stateB = State()
-        let arrived = exchange(local: macB, cloud: drive, device: "mac-b", state: &stateB, browser: nil)
+        let arrived = exchange(local: macB, cloud: drive, device: "mac-b", state: &stateB)
         let onB = decode([Visit].self, macB.appendingPathComponent("history.json")) ?? []
         check(arrived.history && onB.contains(where: { $0.key == "from-a.example" }), "a second Mac receives history through the folder")
         try? FileManager.default.removeItem(at: root)

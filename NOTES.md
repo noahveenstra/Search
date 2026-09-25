@@ -1,3 +1,5 @@
+Search was freezing while it copied an extension out of iCloud. That work now happens off to the side, and an iCloud conflict folder is no longer treated as an extension, so the window stays usable.
+
 WebAuthn is on. A site such as Stripe can offer a passkey or a security key instead of being told this browser has none, and the Mac's own sheet is what answers.
 
 Switching away from a playing video opens the Mac's picture-in-picture window. If the page won't allow that, the video floats in Search's own small window instead of disappearing. Coming back to the tab puts the video in the page again.
