@@ -65,8 +65,10 @@ struct Fold: View {
     private static let edge: CGFloat = 6
     /// The grace before the column goes back in.
     private static let grace: TimeInterval = 0.3
-    /// The band along the top that is the title bar over the page.
-    private static let top: CGFloat = 8
+    /// The band along the top that is the title bar over the page. Nothing
+    /// is drawn there. It is only tall enough to take hold of, the way a
+    /// window's top edge does, and it stays clear of the tabs themselves.
+    private static let top: CGFloat = 28
     /// How long the pointer rests on the edge before a column folded for
     /// good comes out. Long enough to cross the edge, short enough not to be
     /// waited for.
@@ -78,9 +80,8 @@ struct Fold: View {
             // beside the column, and everywhere once it is folded away — and
             // there was nowhere there to drag the window from, or to
             // double-click to fill the screen: only the column's own corner,
-            // gone when folded. A band too thin to be in a page's way stands
-            // in for the title bar along the whole top; the column lies over
-            // it with its own.
+            // gone when folded. An invisible band stands in for the title bar
+            // along the whole top; the column lies over it with its own.
             if prefs.sidebar, browser.active?.immersed != true {
                 DragStrip()
                     .frame(height: Fold.top)

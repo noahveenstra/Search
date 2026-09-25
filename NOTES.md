@@ -1,3 +1,5 @@
+The top of the window, in the sidebar layout, can be taken hold of across a taller invisible band. Nothing new is drawn there.
+
 Sync. Tabs, history, bookmarks, spaces, extensions and cookies follow you to the other Macs on your iCloud account. Passwords go through iCloud Keychain. Turn it off in Settings › General. Nothing is stored in the GitHub repository.
 
 Security, and the mouse wheel. Search 1.0.3 closes the holes found in this week's reviews — an extension could read files outside its own folder, and a page or an ad could open another app without asking — and copying a saved password now asks for Touch ID. A mouse wheel scrolls smoothly again on x.com and pages like it, Bitwarden signs in to a self-hosted server, and extension popups hear what changes while they are open. Also: History opens at once, music keeps playing when you switch spaces, a link from Mail brings Search to the front, a full-screen video no longer goes black, pop-ups need a click, and the tab bar folded away with ⌘S comes back on a ground of its own. Your extensions may each ask once more for their permissions at their next update.
