@@ -49,9 +49,12 @@ final class Passkeys: NSObject {
     private static var waiting: [() -> Void]?
 
     /// Asked before the first ceremony, where it makes sense — a site has
-    /// just asked for a passkey — and then never again.
+    /// just asked for a passkey — and then never again. Not gated on Apple's
+    /// browser entitlement: that grant is what makes the Mac's own passkeys
+    /// available, and the question is how a browser gets it. Hiding WebAuthn
+    /// until then is what made Stripe say the browser had none.
     private static func ensure(_ then: @escaping () -> Void) {
-        guard Preferences.entitledToPasskeys, access == .notDetermined else { return then() }
+        guard access == .notDetermined else { return then() }
         if waiting != nil {
             waiting?.append(then)
             return
