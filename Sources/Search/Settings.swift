@@ -339,11 +339,9 @@ struct SettingsPanel: View {
                 Rule()
                 Line(
                     "Offer passkeys",
-                    !prefs.passkeysPossible
-                        ? "Needs an Apple entitlement this build doesn't have — off keeps sites to the password"
-                        : Passkeys.access == .denied
+                    Passkeys.access == .denied
                         ? "macOS was told no — System Settings › Privacy & Security › Passkeys Access for Web Browsers"
-                        : "Touch ID or an iCloud passkey, on sites that offer one"
+                        : "A passkey or a security key, on sites that offer one"
                 ) {
                     Switch(on: $prefs.passkeys)
                 }

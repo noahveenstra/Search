@@ -1,3 +1,5 @@
+WebAuthn is on. A site such as Stripe can offer a passkey or a security key instead of being told this browser has none, and the Mac's own sheet is what answers.
+
 Switching away from a playing video opens the Mac's picture-in-picture window. If the page won't allow that, the video floats in Search's own small window instead of disappearing. Coming back to the tab puts the video in the page again.
 
 An update no longer installs itself. A note sits in the bottom left corner until you press Update, and nothing changes until you restart. 

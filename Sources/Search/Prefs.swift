@@ -86,15 +86,17 @@ final class Preferences: ObservableObject {
     @Published var extensionsInPrivate: Bool {
         didSet { store.set(extensionsInPrivate, forKey: "extensions.private") }
     }
-    /// Whether sites may ask for a passkey here. Off sends them to the
-    /// password instead — the only thing that works in a build without
-    /// Apple's browser entitlement.
+    /// Whether sites may ask for a passkey or a security key. Off, the
+    /// passkey object is hidden and they ask for a password instead.
     @Published var passkeys: Bool {
-        didSet { store.set(passkeys, forKey: "passkeys") }
+        didSet {
+            store.set(passkeys, forKey: "passkeys")
+            // A change after launch is the person's. The first run is not:
+            // didSet does not run from init, and the old default of off was
+            // not a choice, it was the build hiding WebAuthn.
+            store.set(true, forKey: "passkeys.chosen")
+        }
     }
-    /// Whether this build can actually do them: signed with the entitlement,
-    /// its profile embedded. Fixed for the life of the process.
-    let passkeysPossible: Bool
 
     /// Asked of the running process's own signature, which is the only thing
     /// that decides it — a profile file in the bundle proves nothing on its
@@ -234,18 +236,18 @@ final class Preferences: ObservableObject {
         showsReading = store.object(forKey: "tabs.reading") as? Bool ?? true
         shielded = store.object(forKey: "shield") as? Bool ?? true
         extensionsInPrivate = store.bool(forKey: "extensions.private")
-        // Offered by default only in a build that can actually do them —
-        // one with Apple's browser entitlement and its profile embedded. A
-        // choice made while they couldn't work is not a choice about them:
-        // the first run of a build that can offers them, whatever was set
-        // before; from then on the switch is the person's.
+        // On, unless it was turned off. A build without Apple's browser
+        // entitlement used to store off and hide PublicKeyCredential, so
+        // sites such as Stripe said the browser had no WebAuthn. That stored
+        // off was not a choice. The ceremony is the same one either way: a
+        // security key does not need the entitlement, and the Mac's own
+        // passkeys ask for it the first time a site wants one.
         let entitled = Preferences.entitledToPasskeys
-        passkeysPossible = entitled
-        if entitled, !store.bool(forKey: "passkeys.entitled") {
+        if store.bool(forKey: "passkeys.chosen") {
+            passkeys = store.bool(forKey: "passkeys")
+        } else {
             passkeys = true
             store.set(true, forKey: "passkeys")
-        } else {
-            passkeys = store.object(forKey: "passkeys") as? Bool ?? entitled
         }
         store.set(entitled, forKey: "passkeys.entitled")
         // A test run downloads into its own folder: ~/Downloads would have

@@ -52,12 +52,10 @@ final class FormRelay: NSObject, WKScriptMessageHandler {
 
     /// Whether sites are offered passkeys here (Settings › Passwords).
     ///
-    /// A build without Apple's browser entitlement can't do them: WebKit then
-    /// answers isUserVerifyingPlatformAuthenticatorAvailable() with false,
-    /// yet the API object exists, so sites offer the passkey path and strand
-    /// you there. Taken away, they go straight to the password. Signed with
-    /// the entitlement, as releases are, this is on, and Search carries out
-    /// the sites' requests itself (see Passkeys.swift).
+    /// On, Search carries out the request itself (see Passkeys.swift), and
+    /// the page sees PublicKeyCredential. Off, that object is hidden: a site
+    /// that only checks for it, Stripe among them, would otherwise be told
+    /// this browser has no WebAuthn and never offer a key.
     static var passkeysOffered: Bool {
         get { Store.settings.bool(forKey: "passkeys") }
         set { Store.settings.set(newValue, forKey: "passkeys") }
