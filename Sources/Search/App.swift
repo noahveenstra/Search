@@ -269,6 +269,7 @@ private final class CursorGroundView: NSView {
 
 struct ContentView: View {
     @ObservedObject var browser: Browser
+    @ObservedObject private var updater = Updater.shared
 
     @State private var keys: Any?
     @State private var window: NSWindow?
@@ -477,6 +478,9 @@ struct ContentView: View {
             // The column folded away, and out again at the edge (see Fold.swift).
             .overlay(alignment: .leading) { Fold(browser: browser, prefs: browser.prefs) }
             .overlay(alignment: .bottom) { bars }
+            .overlay(alignment: .bottomLeading) { updateToast }
+            .animation(Motion.settle, value: updater.stage)
+            .animation(Motion.settle, value: updater.toastDismissed)
             .overlay {
                 // Over the page only: the column, the strip and the bookmarks
                 // bar stay as they are, uncovered and in reach.
@@ -553,6 +557,101 @@ struct ContentView: View {
     }
 
     // MARK: - the window
+
+    /// A newer build, waiting in the bottom left until you ask for it.
+    /// It stays. The line in the middle of the window does not.
+    @ViewBuilder
+    private var updateToast: some View {
+        if !updater.toastDismissed, browser.active?.immersed != true, let note = updateNote {
+            HStack(spacing: 12) {
+                VStack(alignment: .leading, spacing: 1) {
+                    Text(note.title)
+                        .font(.system(size: 12.5, weight: .semibold))
+                        .foregroundStyle(Palette.ink)
+                    Text(note.detail)
+                        .font(.system(size: 11))
+                        .foregroundStyle(Palette.muted)
+                }
+                if note.busy {
+                    Ring(size: 12)
+                        .padding(.leading, 4)
+                } else if let action = note.action {
+                    Button(action: action.run) {
+                        Text(action.title)
+                            .font(.system(size: 12, weight: .semibold))
+                            .foregroundStyle(Palette.ground)
+                            .padding(.horizontal, 11)
+                            .padding(.vertical, 5)
+                            .background(Palette.ink, in: Capsule())
+                    }
+                    .buttonStyle(.plain)
+                }
+                Button { updater.dismissToast() } label: {
+                    Image(systemName: "xmark")
+                        .font(.system(size: 9, weight: .bold))
+                        .foregroundStyle(Palette.muted)
+                        .frame(width: 16, height: 16)
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .help("Not now")
+            }
+            .padding(.leading, 14)
+            .padding(.trailing, 10)
+            .padding(.vertical, 10)
+            .background(Palette.ground, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+            .overlay(
+                RoundedRectangle(cornerRadius: 14, style: .continuous)
+                    .strokeBorder(Palette.hairline, lineWidth: 1)
+            )
+            .shadow(color: .black.opacity(0.14), radius: 18, y: 8)
+            .padding(.leading, 16)
+            .padding(.bottom, 16)
+            .transition(.move(edge: .bottom).combined(with: .opacity))
+        }
+    }
+
+    private struct UpdateNote {
+        var title: String
+        var detail: String
+        var busy: Bool
+        var action: (title: String, run: () -> Void)?
+    }
+
+    private var updateNote: UpdateNote? {
+        switch updater.stage {
+        case .none:
+            return nil
+        case .waiting(let next):
+            return UpdateNote(
+                title: "Update available",
+                detail: "Search \(next.version)",
+                busy: false,
+                action: ("Update", { updater.install() })
+            )
+        case .fetching(let next):
+            return UpdateNote(
+                title: "Downloading update",
+                detail: "Search \(next.version)",
+                busy: true,
+                action: nil
+            )
+        case .ready(let next):
+            return UpdateNote(
+                title: "Update ready",
+                detail: "Restart to use Search \(next.version)",
+                busy: false,
+                action: ("Restart", { updater.relaunch() })
+            )
+        case .offered(let next):
+            return UpdateNote(
+                title: "Update available",
+                detail: "Search \(next.version)",
+                busy: false,
+                action: ("Download", { browser.open(next.dmg, foreground: true) })
+            )
+        }
+    }
 
     /// A line that rises from the bottom, says one thing, and leaves.
     @ViewBuilder

@@ -452,10 +452,6 @@ struct SettingsPanel: View {
             Card {
                 Line(versionTitle, versionDetail) { versionControl }
                 Rule()
-                Line("Install updates on its own", "Off, Search still looks once a day and tells you, and installs only when you press Install") {
-                    Switch(on: $prefs.installsUpdates)
-                }
-                Rule()
                 Line("Found something wrong?", "Opens a draft with the version already in it") {
                     Pill("Send Feedback") { Links.writeFeedback() }
                 }
@@ -506,11 +502,11 @@ struct SettingsPanel: View {
         case .fetching(let next):
             return next.notes ?? "Quietly, in the background — nothing you have set is touched"
         case .ready(let next):
-            return next.notes ?? "It's there the next time you open Search"
+            return next.notes ?? "Restart when you want it. Nothing changes until then"
         case .offered(let next):
             return next.notes ?? "Open the disk image, the same as the first time"
         case .waiting(let next):
-            return next.notes ?? "Checked and put in place when you press Install"
+            return next.notes ?? "It waits in the corner until you press Update"
         }
     }
 
@@ -534,7 +530,7 @@ struct SettingsPanel: View {
                 browser.open(next.dmg, foreground: true)
             }
         case .waiting:
-            Pill("Install", filled: true) { updater.install() }
+            Pill("Update", filled: true) { updater.install() }
         }
     }
 

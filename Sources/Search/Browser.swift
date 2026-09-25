@@ -761,7 +761,7 @@ final class Browser: NSObject, ObservableObject {
         // Asked to stay out of the way: it starts that way (see Fold.swift).
         folded = prefs.sidebar && prefs.sideHides
         // Once a day, quietly: is there a newer one?
-        Updater.shared.checkIfDue { [weak self] line in self?.announce(line) }
+        Updater.shared.checkIfDue()
         FormRelay.passkeysOffered = prefs.passkeys
 
         // The History menu lists what the history holds, and the menu is drawn

@@ -3,15 +3,13 @@ import Combine
 import CryptoKit
 import Security
 
-// Knowing when there is a newer one, and having it ready.
+// Knowing when there is a newer one, and waiting to be asked.
 //
 // No framework, no background daemon: one small JSON file next to the
-// download, read once a day and whenever asked. If it names a build newer
-// than this one, the ZIP it points at is fetched quietly, checked, and put
-// where this bundle is — so the next time the app opens, it is the new one.
-// Chrome's way, without Chrome's machinery. Nothing relaunches on its own; a
-// page you are reading is not interrupted by a browser that wants to be
-// newer.
+// download, read once a day and whenever asked. A newer build is not fetched
+// and not put in place until you press Update on the note in the corner.
+// Nothing relaunches on its own, and the next time the app opens it is still
+// this one, until you say otherwise.
 //
 // What the updater leaves alone, on purpose: everything in
 // ~/Library/Application Support/Search by Noah, the defaults under
@@ -83,12 +81,13 @@ final class Updater: ObservableObject {
         /// Couldn't be swapped in from here, so the disk image is offered
         /// instead — the same as the first time.
         case offered(Release)
-        /// Found, and waiting to be asked for: installing on its own is
-        /// switched off in Settings.
+        /// Found, and waiting on the note in the corner.
         case waiting(Release)
     }
 
     @Published private(set) var stage: Stage = .none
+    /// The corner note was put away for this visit. The next launch asks again.
+    @Published var toastDismissed = false
     /// True while the file is being fetched.
     @Published private(set) var checking = false
     /// When the file was last read, for the line in Settings.
@@ -105,11 +104,6 @@ final class Updater: ObservableObject {
     }
 
     private var lastKey: String { "update.checked" }
-    nonisolated static let installKey = "update.install"
-    /// Settings › About › Install updates on its own. On unless switched off.
-    private var installsOnItsOwn: Bool { Store.settings.object(forKey: Updater.installKey) as? Bool ?? true }
-    /// Where a line goes when there is one to say, handed over at launch.
-    private var say: ((String) -> Void)?
 
     private init() {
         // The bundle a swap set aside goes once this process is done with
@@ -121,8 +115,7 @@ final class Updater: ObservableObject {
 
     /// At launch: once a day, quietly. A test run, pointed at its own feed,
     /// checks every time.
-    func checkIfDue(then say: @escaping (String) -> Void) {
-        self.say = say
+    func checkIfDue() {
         Swap.sweep()
         // And again every hour for as long as the app is up — a browser that
         // is left open for a week would otherwise never look.
@@ -132,12 +125,12 @@ final class Updater: ObservableObject {
             }
             clock?.tolerance = 60 * 5
         }
-        checkIfDue()
+        lookIfDue()
     }
 
     private var clock: Timer?
 
-    private func checkIfDue() {
+    private func lookIfDue() {
         let last = Store.settings.object(forKey: lastKey) as? Date ?? .distantPast
         guard Updater.overridden || Date().timeIntervalSince(last) > 60 * 60 * 20 else { return }
         check { _ in }
@@ -163,16 +156,18 @@ final class Updater: ObservableObject {
                 return
             }
             done(found)
-            guard !installsOnItsOwn else { take(found); return }
             switch stage {
             case .fetching, .ready: break
             case .waiting(let known) where known == found: break
             case .none, .offered, .waiting:
+                toastDismissed = false
                 stage = .waiting(found)
-                say?("Search \(found.version) is out — it's in Settings")
             }
         }
     }
+
+    /// The corner note, put away until the next time Search is opened.
+    func dismissToast() { toastDismissed = true }
 
     /// Install, because somebody pressed it: the same fetch, checks and swap
     /// as on its own.
@@ -205,10 +200,8 @@ final class Updater: ObservableObject {
 
     private func landed(_ release: Release, worked: Bool) {
         guard case .fetching(let fetching) = stage, fetching == release else { return }
+        toastDismissed = false
         stage = worked ? .ready(release) : .offered(release)
-        say?(worked
-            ? "Search \(release.version) is ready — it's there the next time you open it"
-            : "Search \(release.version) is out — it's in Settings")
     }
 
     /// Quit, and come back as the new one. A shell waits for this process
