@@ -49,6 +49,9 @@ final class History: ObservableObject {
     /// it each time cost more than everything else a key press does.
     private var recentCache: [Trace]?
     private var saving = false
+    /// True while a save is waiting to be written, so a sync can't reload
+    /// over visits that haven't reached the file yet.
+    private(set) var holding = false
 
     init() { load() }
 
@@ -132,6 +135,12 @@ final class History: ObservableObject {
     func forget() {
         visits = [:]
         save()
+    }
+
+    /// The file changed underneath — another Mac — so the list is read again.
+    func reload() {
+        guard !holding else { return }
+        load()
     }
 
     /// Everywhere you have been, newest first, for the window that shows it.
@@ -308,6 +317,7 @@ final class History: ObservableObject {
     private func save() {
         guard !saving else { return }
         saving = true
+        holding = true
         DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { [weak self] in
             guard let self else { return }
             saving = false
@@ -324,6 +334,10 @@ final class History: ObservableObject {
                     at: History.folder, withIntermediateDirectories: true
                 )
                 try? data.write(to: History.file, options: .atomic)
+                DispatchQueue.main.async {
+                    self.holding = false
+                    CloudSync.shared.notice()
+                }
             }
         }
     }

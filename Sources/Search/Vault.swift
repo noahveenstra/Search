@@ -65,13 +65,16 @@ enum Vault {
     }
 
     /// The items' attributes — no secrets — narrowed by whatever is given.
-    private static func rows(where extra: [String: Any]) -> [[String: Any]] {
+    /// Items saved before syncing are not synchronizable. Asking for "any"
+    /// is what makes a later Mac's iCloud Keychain copies show up here too.
+    private static func rows(where extra: [String: Any], legacyOnly: Bool = false) -> [[String: Any]] {
         var query: [String: Any] = [
             kSecClass as String: kSecClassInternetPassword,
             kSecAttrLabel as String: label,
             kSecReturnAttributes as String: true,
             kSecMatchLimit as String: kSecMatchLimitAll,
         ]
+        if !legacyOnly { query[kSecAttrSynchronizable as String] = kSecAttrSynchronizableAny }
         extra.forEach { query[$0] = $1 }
         var out: CFTypeRef?
         let status = SecItemCopyMatching(query as CFDictionary, &out)
@@ -92,6 +95,7 @@ enum Vault {
             kSecAttrLabel as String: label,
             kSecAttrServer as String: host,
             kSecAttrAccount as String: user,
+            kSecAttrSynchronizable as String: kSecAttrSynchronizableAny,
             kSecReturnData as String: true,
             kSecMatchLimit as String: kSecMatchLimitOne,
         ] as CFDictionary, &out)
@@ -130,6 +134,7 @@ enum Vault {
             kSecAttrServer as String: host,
             kSecAttrAccount as String: user,
             kSecAttrLabel as String: label,
+            kSecAttrSynchronizable as String: kSecAttrSynchronizableAny,
         ]
         // A web form's, which also keeps ours apart from another app's item
         // in the keychain's eyes: one for the same server, account and
@@ -147,6 +152,7 @@ enum Vault {
         guard status == errSecItemNotFound else { return false }
 
         var fresh = identity.merging(fields) { _, new in new }
+        fresh[kSecAttrSynchronizable as String] = kCFBooleanTrue
         fresh[kSecAttrAccessible as String] = kSecAttrAccessibleWhenUnlocked
         return SecItemAdd(fresh as CFDictionary, nil) == errSecSuccess
     }
@@ -162,12 +168,29 @@ enum Vault {
             kSecAttrServer as String: host,
             kSecAttrAccount as String: user,
             kSecAttrLabel as String: label,
+            kSecAttrSynchronizable as String: kSecAttrSynchronizableAny,
         ] as CFDictionary)
+    }
+
+    /// Copies passwords saved before syncing into iCloud Keychain, so the
+    /// other Macs on this account can read them. The old item, which could
+    /// never leave this Mac, is removed once the copy is in.
+    static func shareAcrossDevices() {
+        guard !Store.testing else { return }
+        for login in rows(where: [:], legacyOnly: true).compactMap(login(from:)) {
+            SecItemDelete([
+                kSecClass as String: kSecClassInternetPassword,
+                kSecAttrServer as String: login.host,
+                kSecAttrAccount as String: login.user,
+                kSecAttrLabel as String: label,
+            ] as CFDictionary)
+            _ = save(host: login.host, user: login.user, password: login.password, used: login.used, clear: login.clear)
+        }
     }
 
     // MARK: - sites that asked not to be asked
 
-    private static let neverKey = "passwords.never"
+    static let neverKey = "passwords.never"
 
     static var never: Set<String> {
         get { Set(Store.settings.stringArray(forKey: neverKey) ?? []) }

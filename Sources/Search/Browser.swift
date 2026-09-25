@@ -834,6 +834,7 @@ final class Browser: NSObject, ObservableObject {
         }
         restoreSession()
         if prefs.usesSpaces { preloadSpaces() }
+        CloudSync.shared.start(browser: self)
     }
 
     /// The row of tabs the space on screen had last time, or one empty tab.
@@ -987,7 +988,43 @@ final class Browser: NSObject, ObservableObject {
         Favicons.shared.relook(tabs.filter { !$0.asleep })
     }
 
+    /// Set while a row from another Mac is being put in place, so the swap
+    /// itself is not written back as a newer session.
+    private var suppressSession = false
+
+    func adoptSyncedSession(_ space: UUID) {
+        if space != spaceID {
+            parked[space] = loadRow(space)
+            return
+        }
+        let saved = Session.read(space: space)
+        let incoming = saved.tabs.map(\.url)
+        let have = tabs.compactMap { ($0.pending ?? $0.address)?.absoluteString }
+        if incoming == have { return }
+        suppressSession = true
+        if floating != nil { land() }
+        for tab in tabs { tab.close() }
+        tabs = []
+        activeID = nil
+        restoreSession()
+        suppressSession = false
+    }
+
+    func adoptSpaces() {
+        let next = Spaces.read()
+        spaces = next
+        if !next.contains(where: { $0.id == spaceID }) {
+            spaceID = Space.firstID
+            Spaces.current = spaceID
+            tabs = []
+            activeID = nil
+            restoreSession()
+        }
+        if prefs.usesSpaces { preloadSpaces() }
+    }
+
     func writeSession(now: Bool = false) {
+        guard !suppressSession else { return }
         Session.write(
             now: now,
             space: spaceID,
@@ -1024,6 +1061,7 @@ final class Browser: NSObject, ObservableObject {
     /// quit, before there is a process left to finish the wait on its behalf.
     func flushSession() {
         writeSession(now: true)
+        CloudSync.shared.pushSessionsNow()
     }
 
     // MARK: - tabs

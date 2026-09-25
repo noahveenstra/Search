@@ -205,7 +205,10 @@ final class Preferences: ObservableObject {
     /// Separate sets of tabs, each with its own sign-ins (see Spaces.swift).
     /// Off unless asked for.
     @Published var usesSpaces: Bool {
-        didSet { store.set(usesSpaces, forKey: "spaces") }
+        didSet {
+            store.set(usesSpaces, forKey: "spaces")
+            CloudSync.shared.notice()
+        }
     }
 
     init() {

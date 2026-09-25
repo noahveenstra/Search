@@ -37,7 +37,7 @@ It was built by a design studio that spends its whole day in a browser and was t
 On purpose:
 
 - No extension you have to install to feel at home. Blocking ads, hiding clutter, reading mode, picture-in-picture and passwords are built in; extensions are there for everything else.
-- No sync, no account, no cloud. Your tabs, history and passwords are on your Mac and nowhere else.
+- No account. Tabs, history, bookmarks, extensions and cookies sync through iCloud Drive, and passwords through iCloud Keychain, only to the other Macs on that Apple ID. Nothing is put in the GitHub repository.
 - No telemetry, no analytics, no crash reports sent anywhere. The only things that leave your Mac are the pages you ask for, their icons, and one small request a day to see whether there is a newer version.
 - One window. Tabs are the only kind of "new" there is.
 
@@ -46,7 +46,7 @@ On purpose:
 | What | Where it is | Who can read it |
 |---|---|---|
 | Passwords | The macOS login keychain, as ordinary keychain items tagged `Search by Noah` | Search by Noah, signed by Noah Veenstra. Any other app triggers the system's permission dialog. |
-| History, bookmarks, open tabs, hidden elements | Small JSON files in `~/Library/Application Support/Search by Noah/` | You. |
+| History, bookmarks, open tabs, hidden elements | Small JSON files in `~/Library/Application Support/Search by Noah/`, copied to iCloud Drive when Sync is on | You, and your other Macs on the same iCloud account. |
 | Cookies and site data | WebKit's own store for the app | The sites that set them, as in any browser. |
 | Extensions | Unpacked in `~/Library/Application Support/Search by Noah/Extensions/`, their data in WebKit's extension store | Each extension, within the permissions you accepted when adding it. |
 | Anything else | Nowhere. There is no server. | — |

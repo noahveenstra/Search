@@ -80,6 +80,7 @@ enum Spaces {
         guard let data = try? JSONEncoder().encode(spaces) else { return }
         try? FileManager.default.createDirectory(at: file.deletingLastPathComponent(), withIntermediateDirectories: true)
         try? data.write(to: file, options: .atomic)
+        CloudSync.shared.notice()
     }
 
     /// The space new tabs are made in: the one on screen.

@@ -158,6 +158,20 @@ final class Extensions: NSObject, ObservableObject {
         }
     }
 
+    /// Extensions copied in from another Mac. Ones already running are left
+    /// alone; anything new is started. A copy that arrives before the first
+    /// load is picked up by `start` itself.
+    func adoptSyncedCopies() {
+        installed = (try? JSONDecoder().decode([Installed].self, from: Data(contentsOf: Extensions.list))) ?? []
+        guard !contexts.isEmpty else { return }
+        let known = Set(contexts.keys)
+        Task {
+            for item in installed where item.enabled && !known.contains(item.id) {
+                await load(item)
+            }
+        }
+    }
+
     // MARK: - the row, as WebKit sees it
 
     func adapter(for tab: Tab) -> ExtensionTab {

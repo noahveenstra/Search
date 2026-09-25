@@ -6,9 +6,19 @@ import AppKit
 
 @main
 struct SearchApp: App {
-    @StateObject private var browser = Browser()
+    @StateObject private var browser: Browser
     /// Links from other apps, and the Dock icon.
     @NSApplicationDelegateAdaptor(Links.self) private var links
+
+    init() {
+        if ProcessInfo.processInfo.environment["SEARCH_SYNC_CHECK"] == "1" {
+            let ok = CloudSync.selfTest()
+            fputs(ok ? "sync ok\n" : "sync failed\n", stderr)
+            exit(ok ? 0 : 1)
+        }
+        _browser = StateObject(wrappedValue: Browser())
+        _links = NSApplicationDelegateAdaptor(Links.self)
+    }
 
     var body: some Scene {
         Window("Search by Noah", id: "browser") {

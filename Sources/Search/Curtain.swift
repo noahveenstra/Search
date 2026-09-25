@@ -26,8 +26,16 @@ struct Veil: Codable, Identifiable, Equatable {
 final class Curtain: ObservableObject {
     @Published private(set) var byHost: [String: [Veil]] = [:]
     private var saving = false
+    /// True while a save hasn't reached the file yet.
+    private(set) var holding = false
 
     init() { load() }
+
+    /// The file changed underneath — another Mac.
+    func reload() {
+        guard !holding else { return }
+        load()
+    }
 
     func host(of url: URL?) -> String? {
         guard let host = url?.host()?.lowercased() else { return nil }
@@ -94,17 +102,25 @@ final class Curtain: ObservableObject {
     private func save() {
         guard !saving else { return }
         saving = true
+        holding = true
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) { [weak self] in
             guard let self else { return }
             saving = false
             let snapshot = byHost
             let file = Curtain.file
             DispatchQueue.global(qos: .utility).async {
-                guard let data = try? JSONEncoder().encode(snapshot) else { return }
+                guard let data = try? JSONEncoder().encode(snapshot) else {
+                    DispatchQueue.main.async { self.holding = false }
+                    return
+                }
                 try? FileManager.default.createDirectory(
                     at: file.deletingLastPathComponent(), withIntermediateDirectories: true
                 )
                 try? data.write(to: file, options: .atomic)
+                DispatchQueue.main.async {
+                    self.holding = false
+                    CloudSync.shared.notice()
+                }
             }
         }
     }

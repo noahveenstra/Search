@@ -53,6 +53,7 @@ enum Session {
                 at: file.deletingLastPathComponent(), withIntermediateDirectories: true
             )
             try? data.write(to: file, options: .atomic)
+            CloudSync.shared.notice()
         }
         if now {
             put()

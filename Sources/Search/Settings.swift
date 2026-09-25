@@ -10,6 +10,7 @@ struct SettingsPanel: View {
     @ObservedObject var prefs: Preferences
 
     @ObservedObject private var updater = Updater.shared
+    @ObservedObject private var sync = CloudSync.shared
     @ObservedObject private var shield = Shield.shared
     @State private var isDefault = Links.isDefault
     @State private var page: Page = Page(rawValue: Store.settings.string(forKey: "settings.page") ?? "") ?? .general
@@ -131,7 +132,9 @@ struct SettingsPanel: View {
             ScrollView(showsIndicators: false) {
                 VStack(alignment: .leading, spacing: 18) {
                     switch page {
-                    case .general: general
+                    case .general:
+                        syncCard
+                        general
                     case .tabs: tabs
                     case .extensions: ExtensionsPage(browser: browser)
                     case .passwords: passwords
@@ -150,6 +153,17 @@ struct SettingsPanel: View {
     }
 
     // MARK: - general
+
+    private var syncCard: some View {
+        Card {
+            Line(
+                "Sync this browser",
+                sync.detail + " Passwords follow through iCloud Keychain."
+            ) {
+                Switch(on: $sync.enabled)
+            }
+        }
+    }
 
     private var general: some View {
         Card {
