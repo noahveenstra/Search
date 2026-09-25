@@ -63,7 +63,7 @@ struct WelcomePanel: View {
         VStack(spacing: 22) {
             Plate(size: 72)
             VStack(spacing: 10) {
-                Text("Search")
+                Text("Search by Noah")
                     .font(.system(size: 34, weight: .medium))
                     .foregroundStyle(Palette.ink)
                 Text("A browser with nothing in the way. Four megabytes, the engine already in your Mac, and as little around the page as we could manage.")

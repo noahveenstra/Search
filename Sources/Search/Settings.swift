@@ -423,10 +423,10 @@ struct SettingsPanel: View {
                     .aspectRatio(Logomark.canvas.width / Logomark.canvas.height, contentMode: .fit)
                     .frame(height: 34)
                 VStack(alignment: .leading, spacing: 3) {
-                    Text("Search")
+                    Text("Search by Noah")
                         .font(.system(size: 15, weight: .semibold))
                         .foregroundStyle(Palette.ink)
-                    Text("by Office Commun · version \(Updater.version)")
+                    Text("version \(Updater.version)")
                         .font(.system(size: 12))
                         .foregroundStyle(Palette.muted)
                 }

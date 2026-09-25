@@ -24,9 +24,9 @@
 #     (SEARCH_SIGN_IDENTITY names it; otherwise the first one found is used)
 #   - a notarytool profile: xcrun notarytool store-credentials "search"
 #     (SEARCH_NOTARY_PROFILE names it; default "search")
-#   - SEARCH_DOWNLOAD_URL, the https folder the three files are served from,
-#     for the appcast. Default https://officecommun.com/search, which is
-#     where Updater.feed in Updater.swift looks.
+#   - SEARCH_DOWNLOAD_URL, the https folder the zip and disk image are served
+#     from. Default is this fork's latest GitHub release, the same host as
+#     Updater.feed in Updater.swift. The updater refuses a file on any other host.
 #
 # NOTES.md, next to this script, is what's new: newest release first, one
 # paragraph each. The first paragraph goes into the appcast, and from there
@@ -36,8 +36,10 @@ set -euo pipefail
 cd "$(dirname "$0")"
 CONFIG="${1:-release}"
 STEP="${2:-app}"
-APP="build/Search.app"
-NAME="Search"
+NAME="Search by Noah"
+EXE="SearchByNoah"
+SLUG="SearchByNoah"
+APP="build/$NAME.app"
 VERSION="$(tr -d '[:space:]' < VERSION)"
 # A build number that only ever goes up, so the updater can tell newer from
 # older without parsing version strings.
@@ -51,7 +53,7 @@ BINARY=".build/$CONFIG/Search"
 
 rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
-cp "$BINARY" "$APP/Contents/MacOS/$NAME"
+cp "$BINARY" "$APP/Contents/MacOS/$EXE"
 
 # Symbols stay out of the app. The linker leaves every function's name and a
 # map back to the source in the binary — 15,000 entries, more than half of
@@ -62,7 +64,7 @@ cp "$BINARY" "$APP/Contents/MacOS/$NAME"
 if [ "$CONFIG" = "release" ]; then
   rm -rf "$APP.dSYM"
   dsymutil "$BINARY" -o "$APP.dSYM" 2>/dev/null || echo "no dSYM this time" >&2
-  strip -x "$APP/Contents/MacOS/$NAME"
+  strip -x "$APP/Contents/MacOS/$EXE"
 fi
 
 # The icon, drawn fresh each time — it is thirty lines of Swift, not an asset
@@ -80,15 +82,15 @@ cat > "$APP/Contents/Info.plist" <<PLIST
 <dict>
   <key>CFBundleName</key><string>$NAME</string>
   <key>CFBundleDisplayName</key><string>$NAME</string>
-  <key>CFBundleExecutable</key><string>$NAME</string>
-  <key>CFBundleIdentifier</key><string>com.officecommun.search</string>
+  <key>CFBundleExecutable</key><string>$EXE</string>
+  <key>CFBundleIdentifier</key><string>com.noahveenstra.search</string>
   <key>CFBundlePackageType</key><string>APPL</string>
   <key>CFBundleShortVersionString</key><string>$VERSION</string>
   <key>CFBundleVersion</key><string>$BUILD</string>
   <key>CFBundleIconFile</key><string>AppIcon</string>
   <key>LSMinimumSystemVersion</key><string>$MINIMUM</string>
   <key>LSApplicationCategoryType</key><string>public.app-category.productivity</string>
-  <key>NSHumanReadableCopyright</key><string>© Office Commun · Search</string>
+  <key>NSHumanReadableCopyright</key><string>© Noah Veenstra</string>
   <key>NSHighResolutionCapable</key><true/>
   <!-- Owning http and https is what sends a link clicked in Mail here.
        Appearing in Desktop & Dock → Default web browser also needs the
@@ -171,7 +173,7 @@ echo "built: $APP ($VERSION, build $BUILD)"
 # layout file itself, so no Finder is scripted and no window opens mid-build.
 # dmgbuild is installed into .build the first time, and needs Python 3 and a
 # network then; without it the image is the plain one it always was.
-DMG="build/$NAME.dmg"
+DMG="build/$SLUG.dmg"
 ART="build/installer"
 rm -rf "$ART" "$DMG"
 DMGBUILD=".build/dmgbuild/bin/dmgbuild"
@@ -201,7 +203,7 @@ echo "packed: $DMG"
 
 # The ZIP is what the updater fetches, and its hash is what the updater
 # checks before opening it.
-ZIP="build/$NAME.zip"
+ZIP="build/$SLUG.zip"
 rm -f "$ZIP"
 ditto -c -k --keepParent "$APP" "$ZIP"
 SHA="$(shasum -a 256 "$ZIP" | cut -d' ' -f1)"
@@ -209,7 +211,7 @@ echo "packed: $ZIP"
 
 # What the updater reads. The first paragraph of NOTES.md, with the two
 # characters JSON minds escaped, is the line under the version in Settings.
-BASE="${SEARCH_DOWNLOAD_URL:-https://officecommun.com/search}"
+BASE="${SEARCH_DOWNLOAD_URL:-https://github.com/noahveenstra/Search/releases/latest/download}"
 BASE="${BASE%/}"
 NOTES=""
 if [ -f NOTES.md ]; then
@@ -220,8 +222,8 @@ cat > build/appcast.json <<JSON
 {
   "version": "$VERSION",
   "build": $BUILD,
-  "url": "$BASE/$NAME.zip",
-  "dmg": "$BASE/$NAME.dmg",
+  "url": "$BASE/$SLUG.zip",
+  "dmg": "$BASE/$SLUG.dmg",
   "sha256": "$SHA",
   "notes": "$NOTES",
   "minimumSystemVersion": "$MINIMUM"

@@ -1,27 +1,39 @@
 #!/bin/bash
-# Puts the three files the site serves into the site: the disk image for
-# people, the ZIP for the updater, and the appcast that names them both.
+# Publishes the disk image, the updater zip, and appcast.json on a GitHub
+# release. The app reads the appcast from the latest release, and the zip it
+# names has to be on that same host.
 #
-#   ./publish.sh "../Office Commun Website/public/search"
+#   ./publish.sh
 #
-# ./build.sh release ship makes them first (release dmg makes them too, but
-# unnotarised — fine for trying, not for anyone else's Mac). The names never
-# change, so the site's links never have to.
+# ./build.sh release ship makes the three files first. The tag is v<version>
+# from VERSION. Re-releasing the same version means deleting that release
+# first — a build number can move, a tag cannot.
 set -euo pipefail
 
 cd "$(dirname "$0")"
-[ $# -eq 1 ] || { echo "usage: ./publish.sh <folder>" >&2; exit 1; }
-FOLDER="$1"
-FILES=(Search.dmg Search.zip appcast.json)
+VERSION="$(tr -d '[:space:]' < VERSION)"
+TAG="v$VERSION"
+REPO="${SEARCH_RELEASE_REPO:-noahveenstra/Search}"
+FILES=(build/SearchByNoah.dmg build/SearchByNoah.zip build/appcast.json)
 
 for FILE in "${FILES[@]}"; do
-  [ -f "build/$FILE" ] || { echo "build/$FILE is missing — ./build.sh release dmg makes it" >&2; exit 1; }
+  [ -f "$FILE" ] || { echo "$FILE is missing — ./build.sh release ship makes it" >&2; exit 1; }
 done
-xcrun stapler validate -q "build/Search.dmg" >/dev/null 2>&1 \
-  || echo "note: build/Search.dmg is not notarised — ./build.sh release ship does that" >&2
 
-mkdir -p "$FOLDER"
-for FILE in "${FILES[@]}"; do
-  cp "build/$FILE" "$FOLDER/$FILE"
-  echo "copied: build/$FILE → $FOLDER/$FILE"
-done
+NOTES="Search by Noah $VERSION"
+if [ -f NOTES.md ]; then
+  FIRST="$(awk 'NF { printf "%s%s", (n++ ? " " : ""), $0; next } n { exit }' NOTES.md)"
+  [ -n "$FIRST" ] && NOTES="$FIRST"
+fi
+
+if gh release view "$TAG" --repo "$REPO" >/dev/null 2>&1; then
+  echo "release $TAG already exists on $REPO — delete it before publishing this version again" >&2
+  exit 1
+fi
+
+gh release create "$TAG" "${FILES[@]}" \
+  --repo "$REPO" \
+  --title "Search by Noah $VERSION" \
+  --notes "$NOTES"
+
+echo "released: https://github.com/$REPO/releases/tag/$TAG"

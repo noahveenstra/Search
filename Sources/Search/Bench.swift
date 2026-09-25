@@ -73,7 +73,7 @@ final class Bench {
         private static var query: [String: Any] {
             [kSecClass as String: kSecClassGenericPassword,
              kSecUseDataProtectionKeychain as String: true,
-             kSecAttrService as String: "com.officecommun.search.bench",
+             kSecAttrService as String: "com.noahveenstra.search.bench",
              kSecAttrAccount as String: Store.world.map { "consent (\($0))" } ?? "consent"]
         }
 
@@ -856,8 +856,8 @@ final class Bench {
                 return
             }
             let items = NSApp.mainMenu?.items.first { $0.submenu?.title == "Window" }?.submenu?.items ?? []
-            guard let item = items.first(where: { $0.title == "Search" }), let action = item.action else {
-                answer(["error": "no Search item in the Window menu", "items": items.map(\.title)])
+            guard let item = items.first(where: { $0.title == "Search by Noah" }), let action = item.action else {
+                answer(["error": "no Search by Noah item in the Window menu", "items": items.map(\.title)])
                 return
             }
             NSApp.sendAction(action, to: item.target, from: item)

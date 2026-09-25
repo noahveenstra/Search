@@ -1,12 +1,12 @@
-# Search
+# Search by Noah
 
-A small, fast, quiet web browser for the Mac, by [Office Commun](https://officecommun.com).
+Noah's fork of [Search](https://github.com/driceroland/Search), the small WebKit browser by [Office Commun](https://officecommun.com). This copy is signed by Noah Veenstra, keeps its own tabs, history and passwords, and updates from this repository's GitHub releases. It can sit next to the official app.
 
 ![Search, with its tabs down the left and a page taking the rest of the window](.github/screenshot.png)
 
-**[Download for macOS →](https://officecommun.com/search)** · macOS 14 or later · free · about 3 MB
+**[Download for macOS →](https://github.com/noahveenstra/Search/releases/latest)** · macOS 14 or later
 
-Or with [Homebrew](https://brew.sh): `brew install --cask driceroland/tap/search`
+The installed app checks `appcast.json` on the latest release once a day, downloads the zip from that same release, and swaps it in for the next launch only if it is signed with the same Developer ID.
 
 ---
 
@@ -30,7 +30,7 @@ It was built by a design studio that spends its whole day in a browser and was t
 - **Light, dark, or the Mac's own.** The frame and the pages follow.
 - **Bookmarks, history, downloads** — each a panel, each searchable, each one keystroke away.
 - **Chrome extensions, without Chrome.** Paste a Chrome Web Store link in Settings › Extensions, or open the extension's page in Search and press Add. It runs on WebKit's own extension engine — the one Safari uses — and where Chrome has APIs WebKit doesn't (bookmarks, history, downloads, side panel, offscreen documents, fonts, notifications, speech, OAuth sign-in), Search fills them in itself. They live behind the puzzle button; pin the ones you use often. Building your own? Load its folder as an unpacked extension and press Reload after each change, as in Chrome's developer mode. macOS 15.4 or later.
-- **Updates itself, quietly.** Once a day it checks for a newer build, downloads it, verifies it is signed by Office Commun, and swaps it in for the next launch. Nothing restarts on its own.
+- **Updates itself, quietly.** Once a day it checks for a newer build, downloads it, verifies it is signed by Noah Veenstra, and swaps it in for the next launch. Nothing restarts on its own.
 
 ## What it doesn't do
 
@@ -45,10 +45,10 @@ On purpose:
 
 | What | Where it is | Who can read it |
 |---|---|---|
-| Passwords | The macOS login keychain, as ordinary keychain items tagged `Search` | Search, signed by Office Commun. Any other app triggers the system's permission dialog. |
-| History, bookmarks, open tabs, hidden elements | Small JSON files in `~/Library/Application Support/Search/` | You. |
+| Passwords | The macOS login keychain, as ordinary keychain items tagged `Search by Noah` | Search by Noah, signed by Noah Veenstra. Any other app triggers the system's permission dialog. |
+| History, bookmarks, open tabs, hidden elements | Small JSON files in `~/Library/Application Support/Search by Noah/` | You. |
 | Cookies and site data | WebKit's own store for the app | The sites that set them, as in any browser. |
-| Extensions | Unpacked in `~/Library/Application Support/Search/Extensions/`, their data in WebKit's extension store | Each extension, within the permissions you accepted when adding it. |
+| Extensions | Unpacked in `~/Library/Application Support/Search by Noah/Extensions/`, their data in WebKit's extension store | Each extension, within the permissions you accepted when adding it. |
 | Anything else | Nowhere. There is no server. | — |
 
 A **private tab** (`⇧⌘N`) has its own cookie jar and leaves nothing behind when it closes.
@@ -75,7 +75,7 @@ So anyone can read exactly what a browser handling their passwords and history i
 
 - macOS 14 or later, Xcode 16 / Swift 6 toolchain
 - `swift build` — runs the app straight from the SwiftPM binary
-- `./build.sh` — assembles a real, double-clickable `Search.app` in `build/`, ad-hoc signed so it runs on your own Mac
+- `./build.sh` — assembles a real, double-clickable `Search by Noah.app` in `build/`. A Developer ID certificate in the keychain signs it; otherwise it is ad-hoc signed and runs on this Mac only
 
 A build you make yourself won't be notarized or carry Office Commun's Developer ID, so the first launch needs a right-click → Open (or an allow in System Settings → Privacy & Security). That's expected — it's the same thing that happens with any app that isn't from the App Store or a notarized DMG. Your own build also keeps its passwords apart from a signed Search's: the keychain tells the two apart by their signatures.
 

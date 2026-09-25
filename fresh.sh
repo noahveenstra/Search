@@ -18,10 +18,10 @@ cd "$(dirname "$0")"
 WORLD=$(printf '%s' "${SEARCH_PROBE:-test}" | tr 'A-Z' 'a-z' | tr -cd 'a-z0-9-')
 case "$WORLD" in ""|1) WORLD=test ;; esac
 if [ "$WORLD" = test ]; then
-  SUITE=com.officecommun.search.test; HASH=0
+  SUITE=com.noahveenstra.search.test; HASH=0
 else
   # Store.probeStore: FNV-1a of the name in the store's identifier.
-  SUITE="com.officecommun.search.test.$WORLD"; HASH=2166136261
+  SUITE="com.noahveenstra.search.test.$WORLD"; HASH=2166136261
   for ((i = 0; i < ${#WORLD}; i++)); do
     HASH=$(( ((HASH ^ $(printf '%d' "'${WORLD:i:1}")) * 16777619) & 0xFFFFFFFF ))
   done
@@ -29,12 +29,12 @@ fi
 STORE=$(printf '5E4C%04X-%04X-4000-8000-000000000001' $((HASH >> 16)) $((HASH & 0xFFFF)))
 
 if [ "${1:-}" != "again" ]; then
-  rm -rf "$HOME/Library/Application Support/Search ($WORLD)"
+  rm -rf "$HOME/Library/Application Support/Search by Noah ($WORLD)"
   defaults delete "$SUITE" 2>/dev/null || true
   # Store.probeStore(1), the fixed identifier of the world's website data.
-  rm -rf "$HOME/Library/WebKit/com.officecommun.search/WebsiteDataStore/$STORE"
+  rm -rf "$HOME/Library/WebKit/com.noahveenstra.search/WebsiteDataStore/$STORE"
   echo "world \"$WORLD\" wiped"
 fi
 
-[ -d "build/Search.app" ] || ./build.sh release
-open -n --env SEARCH_PROBE="$WORLD" "build/Search.app"
+[ -d "build/Search by Noah.app" ] || ./build.sh release
+open -n --env SEARCH_PROBE="$WORLD" "build/Search by Noah.app"

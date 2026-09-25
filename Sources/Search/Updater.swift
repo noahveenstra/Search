@@ -14,8 +14,8 @@ import Security
 // newer.
 //
 // What the updater leaves alone, on purpose: everything in
-// ~/Library/Application Support/Search, the defaults under
-// com.officecommun.search, and the keychain. The session, the pins, the
+// ~/Library/Application Support/Search by Noah, the defaults under
+// com.noahveenstra.search, and the keychain. The session, the pins, the
 // history, the passwords — none of it is read, moved or rewritten here. Only
 // the bundle changes hands, and it keeps its bundle id and its signing
 // identity, so the keychain items the old build made open for the new one.
@@ -33,13 +33,13 @@ final class Updater: ObservableObject {
     /// else — and is the only way plain http is accepted, so a build that
     /// was not handed the variable only ever listens to the real site.
     /// SEARCH_FEED points a test run at a feed of its own. Only a test run:
-    /// the browser people use reads Office Commun's feed whatever the
-    /// environment it was started with says.
+    /// the browser people use reads this fork's GitHub release feed whatever
+    /// the environment it was started with says.
     static let feed: URL = {
         if overridden, let set = ProcessInfo.processInfo.environment["SEARCH_FEED"], let url = URL(string: set) {
             return url
         }
-        return URL(string: "https://officecommun.com/search/appcast.json")!
+        return URL(string: "https://github.com/noahveenstra/Search/releases/latest/download/appcast.json")!
     }()
 
     private static var overridden: Bool {

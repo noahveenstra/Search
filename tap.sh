@@ -1,12 +1,9 @@
 #!/bin/bash
-# Points Homebrew at the version just released: the cask in
-# github.com/driceroland/homebrew-tap gets this version and the checksum of
-# the disk image on its GitHub release, so that
-#
-#   brew install --cask driceroland/tap/search
-#
-# installs it, and brew upgrade brings it. Run it once the release is on
-# GitHub (tag vX.Y.Z, Search.dmg attached); it reads the version from VERSION.
+# This fork does not publish a Homebrew cask. Updates ship as GitHub releases
+# via ./publish.sh, which is what the app's updater reads. The script below
+# is Office Commun's tap publisher and would push to their repository.
+echo "this fork publishes with ./publish.sh, not a Homebrew tap" >&2
+exit 1
 set -euo pipefail
 
 cd "$(dirname "$0")"
