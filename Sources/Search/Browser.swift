@@ -40,6 +40,15 @@ final class Browser: NSObject, ObservableObject {
     private var pipDone: (() -> Void)?
     /// The ask was because another app came forward. Coming back first cancels it.
     private var pipForAway = false
+    /// Bumped when an ask is cancelled, so a late fallback can't open a window
+    /// after the video was told to stay in the page.
+    private var pipGeneration = 0
+    /// Set when the system window was reported open. If it dies as the page
+    /// leaves the stage, the in-app window takes the video instead.
+    private var pipWatch: UUID?
+    /// The WebKit toggle has already been sent for this ask. A second one
+    /// while the window is still opening cancels it.
+    private var pipToggled = false
 
     /// Everything there is to set. Held here so the whole window redraws when
     /// one of them changes.
@@ -1147,13 +1156,19 @@ final class Browser: NSObject, ObservableObject {
         suggesting = nil
         guard tab.id != activeID else {
             // Still here: a switch that was waiting on picture in picture is
-            // no longer wanted, and the video stays in the page.
-            if pipToken != nil { land() }
+            // no longer wanted, and a video already out comes back into the page.
+            if pipToken != nil || floating == tab.id || nativePiP == tab.id { land() }
             return
         }
         // Coming back to the tab whose video is out brings it home first, so
-        // it is never lifted and landed in the same breath.
-        if floating == tab.id || nativePiP == tab.id { land() }
+        // it is never lifted and landed in the same breath. A video left in
+        // picture-in-picture with no system window paints black, and nothing
+        // else will ask it to come back — so showing the tab does.
+        if floating == tab.id || nativePiP == tab.id {
+            land()
+        } else if let web = tab.built {
+            releasePicture(web, tries: 0) {}
+        }
         leaving { [weak self] in
             guard let self, self.tabs.contains(where: { $0.id == tab.id }) else { return }
             self.activeID = tab.id
@@ -1594,8 +1609,9 @@ final class Browser: NSObject, ObservableObject {
         guard away else { return }
         if pipToken != nil, pipForAway, pipDone == nil {
             pipForAway = false
+            pipGeneration += 1
             pipToken = nil
-            if let web = active?.built { stopPicture(web) }
+            if let web = active?.built { releasePicture(web, tries: 0) {} }
             return
         }
         pipForAway = false
@@ -1638,10 +1654,13 @@ final class Browser: NSObject, ObservableObject {
         }
         let token = UUID()
         pipToken = token
+        pipGeneration += 1
+        pipToggled = false
         pipDone = then
         attemptPicture(tab, token: token, quietly: quietly, round: 1)
         // A page that never answers must not hold the tab change forever.
-        DispatchQueue.main.asyncAfter(deadline: .now() + 5) { [weak self] in
+        // Long enough for one toggle to be given a few seconds to appear.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 7) { [weak self] in
             self?.fallbackPicture(tab, token: token, quietly: quietly)
         }
     }
@@ -1665,11 +1684,16 @@ final class Browser: NSObject, ObservableObject {
 
     private func pictureEntered(_ value: Any?, tab: Tab, token: UUID, quietly: Bool, round: Int) {
         guard pipToken == token else { return }
-        if (value as? String) == "none" {
-            if quietly {
-                endPictureAsk(opened: false, tab: tab)
+        let answer = value as? String
+        // Nothing is playing. A hand-asked shortcut says so; a tab change just goes.
+        // Once the toggle has been sent, a later "none" is the page mid-change,
+        // not a reason to give up on the window that is still opening.
+        if answer == "none" {
+            if pipToggled {
+                watchPicture(tab, token: token, quietly: quietly, round: round, polls: 0)
             } else {
-                fallbackPicture(tab, token: token, quietly: quietly)
+                if !quietly { announce("Nothing is playing here") }
+                endPictureAsk(opened: false, tab: tab)
             }
             return
         }
@@ -1677,7 +1701,26 @@ final class Browser: NSObject, ObservableObject {
             endPictureAsk(opened: true, tab: tab)
             return
         }
-        tab.built?.pictureInPictureToggle()
+        // The page has a video and refused the system window, or it didn't
+        // answer. Float it. Toggling here is what leaves presentation mode on
+        // with no window, and the player then paints black.
+        if answer != "pending", answer != "asked" {
+            if pipToggled {
+                watchPicture(tab, token: token, quietly: quietly, round: round, polls: 0)
+            } else {
+                fallbackPicture(tab, token: token, quietly: quietly)
+            }
+            return
+        }
+        guard pipToken == token else { return }
+        // 'pending' means the mode is already picture-in-picture. The system
+        // window still needs one WebKit toggle. A second toggle while that
+        // window is opening cancels it, so later rounds only repeat the ask.
+        // 'asked' is the standard call, still in flight — toggling now cancels that too.
+        if answer == "pending", !pipToggled, tab.built?.pictureInPictureCanToggle() == true {
+            tab.built?.pictureInPictureToggle()
+            pipToggled = true
+        }
         watchPicture(tab, token: token, quietly: quietly, round: round, polls: 0)
     }
 
@@ -1687,6 +1730,8 @@ final class Browser: NSObject, ObservableObject {
             endPictureAsk(opened: true, tab: tab)
             return
         }
+        // About a second between asks. The system window often arrives on the
+        // ask after the toggle, not on the toggle itself.
         if polls < 4 {
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { [weak self] in
                 self?.watchPicture(tab, token: token, quietly: quietly, round: round, polls: polls + 1)
@@ -1709,7 +1754,24 @@ final class Browser: NSObject, ObservableObject {
         if opened { nativePiP = tab.id }
         let done = pipDone
         pipDone = nil
+        if opened { watchOpenedPicture(tab) }
         done?()
+    }
+
+    /// The system window can report itself open and then die the moment the
+    /// page leaves the stage. The in-app window is there for that, so a tab
+    /// change never ends with no video at all.
+    private func watchOpenedPicture(_ tab: Tab) {
+        let watch = UUID()
+        pipWatch = watch
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.7) { [weak self, weak tab] in
+            guard let self, let tab, self.pipWatch == watch else { return }
+            self.pipWatch = nil
+            if tab.built?.pictureInPictureIsActive() == true { return }
+            if self.nativePiP == tab.id { self.nativePiP = nil }
+            guard self.pipToken == nil, self.floating == nil, !self.floater.showing else { return }
+            self.liftInApp(tab, quietly: true)
+        }
     }
 
     private func fallbackPicture(_ tab: Tab, token: UUID, quietly: Bool) {
@@ -1718,13 +1780,35 @@ final class Browser: NSObject, ObservableObject {
             endPictureAsk(opened: true, tab: tab)
             return
         }
+        // Stop the retry loop, but do not change tabs until the video is back
+        // inline and, if it is still playing, sitting in the in-app window.
+        // Taking the page off screen before either of those paints it black,
+        // and coming back then has nothing to restore.
+        let generation = pipGeneration
         pipToken = nil
-        let done = pipDone
-        pipDone = nil
-        // The system window never appeared. Put the video back inline before
-        // the in-app window takes the page, or it plays to a black box.
-        tab.built?.evaluateJavaScript(Picture.exit, in: nil, in: .page)
-        liftInApp(tab, quietly: quietly, then: done)
+        guard let web = tab.built else {
+            let done = pipDone
+            pipDone = nil
+            done?()
+            return
+        }
+        releasePicture(web, tries: 0) { [weak self, weak tab] in
+            guard let self, let tab, self.pipGeneration == generation else { return }
+            if tab.built?.pictureInPictureIsActive() == true || self.nativePiP == tab.id {
+                self.nativePiP = tab.id
+                self.watchOpenedPicture(tab)
+                let done = self.pipDone
+                self.pipDone = nil
+                done?()
+                return
+            }
+            self.liftInApp(tab, quietly: quietly) {
+                guard self.pipGeneration == generation else { return }
+                let done = self.pipDone
+                self.pipDone = nil
+                done?()
+            }
+        }
     }
 
     /// Everything but the video goes out of the way, and the page it lives in
@@ -1753,32 +1837,63 @@ final class Browser: NSObject, ObservableObject {
         // The window closes whatever else is true. Tying that to the bookkeeping
         // is how a little window outlives the thing that opened it.
         let pending = pipToken != nil
+        pipGeneration += 1
+        pipWatch = nil
+        pipToggled = false
         pipToken = nil
         pipDone = nil
         pipForAway = false
         if floater.showing { floater.drop() }
         if let id = nativePiP, let tab = tabs.first(where: { $0.id == id }) {
-            if let web = tab.built { stopPicture(web) }
+            if let web = tab.built { releasePicture(web, tries: 0) {} }
             nativePiP = nil
         } else if pending, let web = active?.built {
-            stopPicture(web)
+            releasePicture(web, tries: 0) {}
         }
         guard let id = floating, let tab = tabs.first(where: { $0.id == id }) else { return }
         floating = nil
         tab.floating = false
+        // The in-app window can be up while presentation mode is still
+        // picture-in-picture. Put that back before the page is shown again.
+        if let web = tab.built { releasePicture(web, tries: 0) {} }
         tab.web.evaluateInSearch(Isolate.off)
     }
 
-    /// Leaves the Mac's picture-in-picture window. The page is asked first;
-    /// the WebKit control is the backup when that ask cannot be sent.
-    private func stopPicture(_ web: WKWebView) {
+    /// Leaves the Mac's picture-in-picture window, and a presentation mode
+    /// that was set without one. Asked as a user gesture, then checked again
+    /// once that ask has had a moment to land. The WebKit toggle is not used
+    /// here: while the window is up it cancels the exit, and while it is not
+    /// it can open a mode no window is showing.
+    private func releasePicture(_ web: WKWebView, tries: Int, then: @escaping () -> Void) {
         let asked = web.evaluateAsUserGesture(Picture.exit) { _ in
             Task { @MainActor in
-                if web.pictureInPictureIsActive() { web.pictureInPictureToggle() }
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) { [weak self, weak web] in
+                    guard let self, let web else {
+                        then()
+                        return
+                    }
+                    self.confirmPictureInline(web, tries: tries, then: then)
+                }
             }
         }
-        if !asked, web.pictureInPictureIsActive() {
-            web.pictureInPictureToggle()
+        if !asked { then() }
+    }
+
+    private func confirmPictureInline(_ web: WKWebView, tries: Int, then: @escaping () -> Void) {
+        web.evaluateJavaScript(Picture.mode, in: nil, in: .page) { [weak self, weak web] result in
+            Task { @MainActor in
+                guard let self, let web else {
+                    then()
+                    return
+                }
+                let mode = try? result.get()
+                let inline = (mode as? String) == "inline" && !web.pictureInPictureIsActive()
+                if inline || tries >= 4 {
+                    then()
+                    return
+                }
+                self.releasePicture(web, tries: tries + 1, then: then)
+            }
         }
     }
 

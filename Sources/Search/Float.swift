@@ -6,10 +6,13 @@ import WebKit
 // First choice is the Mac's own picture-in-picture window — the same one
 // Safari uses, which lives outside this app. WebKit only opens it for a
 // click on the page, so the menu and the shortcut hand the call over as a
-// user gesture. When a page still refuses, the page itself is moved: everything
-// but the video is made invisible, the video is stretched to fill the viewport,
-// and the whole web view is lifted into a small floating window. The video
-// never stops, because it is the same page it always was.
+// user gesture. When a page still refuses — YouTube turns the Mac's window
+// off on purpose — the page itself is moved: everything but the video is made
+// invisible, the video is stretched to fill the viewport, and the whole web
+// view is lifted into a small floating window. The video never stops, because
+// it is the same page it always was. The page is not taken off screen until
+// that system window is really up, or the video is back in the page. Left
+// halfway, the player paints black and coming back to the tab cannot restore it.
 
 @MainActor
 final class Float {
@@ -626,44 +629,126 @@ enum Players {
 /// The Mac's picture-in-picture window, asked for by the browser rather than
 /// by a button on the page.
 enum Picture {
-    /// The largest video that is actually playing. 'pending' means the system
-    /// window was asked for; 'none' means there was nothing to ask with.
-    static let enter = """
-    (function () {
-      var videos = document.querySelectorAll('video');
-      var best = null, area = 0;
+    /// Players keep the video inside an open shadow root, where
+    /// querySelectorAll on the document cannot see it. Walk those too.
+    static let collect = """
+    function officeCollect(root, out, depth) {
+      if (!root || depth > 16 || out.length > 48) return;
+      if (!root.querySelectorAll) return;
+      var videos = root.querySelectorAll('video');
+      for (var i = 0; i < videos.length; i++) out.push(videos[i]);
+      var hosts = root.querySelectorAll('*');
+      for (var j = 0; j < hosts.length; j++) {
+        if (hosts[j].shadowRoot) officeCollect(hosts[j].shadowRoot, out, depth + 1);
+      }
+    }
+    function officeBest(videos) {
+      var best = null, score = -1;
       for (var i = 0; i < videos.length; i++) {
         var v = videos[i];
-        if (v.paused || v.ended || v.readyState < 2) continue;
+        var inPip = v.webkitPresentationMode === 'picture-in-picture' || v === document.pictureInPictureElement;
+        if (!inPip) {
+          if (v.paused || v.ended) continue;
+          if (v.readyState < 2 && !(v.videoWidth > 0)) continue;
+        }
         var box = v.getBoundingClientRect();
-        if (box.width * box.height >= area) { area = box.width * box.height; best = v; }
+        var area = box.width * box.height;
+        if (area < 2) area = (v.videoWidth || 0) * (v.videoHeight || 0);
+        if (area >= score) { score = area; best = v; }
       }
+      return best;
+    }
+    """
+
+    /// 'pending' — presentation mode is picture-in-picture, and the system
+    /// window still needs WebKit's toggle. 'asked' — the standard call is in
+    /// flight; toggling now would cancel it. 'video' — something is playing
+    /// but the page refused the system window, so the in-app one should take
+    /// it. 'none' — nothing is playing.
+    static let enter = """
+    (function () {
+      \(Picture.collect)
+      var videos = [];
+      officeCollect(document, videos, 0);
+      var best = officeBest(videos);
       if (!best) return 'none';
+      if (best.webkitPresentationMode === 'picture-in-picture' || document.pictureInPictureElement === best) return 'pending';
       try {
-        if (best.webkitSetPresentationMode && (!best.webkitSupportsPresentationMode || best.webkitSupportsPresentationMode('picture-in-picture'))) {
-          best.webkitSetPresentationMode('picture-in-picture');
-          return 'pending';
+        best.disablePictureInPicture = false;
+        best.removeAttribute('disablepictureinpicture');
+        Object.defineProperty(best, 'disablePictureInPicture', {
+          configurable: true,
+          get: function () { return false; },
+          set: function () {}
+        });
+      } catch (e) {}
+      try {
+        if (best.webkitSetPresentationMode) {
+          var allowed = !best.webkitSupportsPresentationMode || best.webkitSupportsPresentationMode('picture-in-picture');
+          if (allowed) {
+            best.webkitSetPresentationMode('picture-in-picture');
+            if (best.webkitPresentationMode === 'picture-in-picture') return 'pending';
+          }
         }
       } catch (e) {}
       try {
-        if (best.requestPictureInPicture) { best.requestPictureInPicture(); return 'pending'; }
+        if (best.requestPictureInPicture) {
+          var pending = best.requestPictureInPicture();
+          if (pending && pending.catch) pending.catch(function () {});
+          return 'asked';
+        }
       } catch (e) {}
-      return 'none';
+      return 'video';
     })();
     """
 
+    /// Puts the video back in the page. The system window is closed on its
+    /// own. Asking the element to go inline in that same call uses up the
+    /// gesture, and the window then stays up while the player paints black.
+    /// Inline is only set when there is no system window — a mode left on
+    /// with nothing showing.
     static let exit = """
     (function () {
-      var videos = document.querySelectorAll('video');
-      for (var i = 0; i < videos.length; i++) {
-        var v = videos[i];
-        try {
-          if (v.webkitPresentationMode === 'picture-in-picture') v.webkitSetPresentationMode('inline');
-        } catch (e) {}
-      }
+      \(Picture.collect)
+      var videos = [];
+      officeCollect(document, videos, 0);
+      var hadElement = !!document.pictureInPictureElement;
       try {
-        if (document.pictureInPictureElement && document.exitPictureInPicture) document.exitPictureInPicture();
+        if (hadElement && document.exitPictureInPicture) {
+          var pending = document.exitPictureInPicture();
+          if (pending && pending.catch) pending.catch(function () {});
+        }
       } catch (e) {}
+      if (!hadElement) {
+        for (var i = 0; i < videos.length; i++) {
+          var v = videos[i];
+          try { v.disablePictureInPicture = false; } catch (e) {}
+          try {
+            if (v.webkitPresentationMode === 'picture-in-picture' && v.webkitSetPresentationMode) {
+              v.webkitSetPresentationMode('inline');
+            }
+          } catch (e) {}
+        }
+      }
+      if (document.pictureInPictureElement) return 'picture-in-picture';
+      for (var j = 0; j < videos.length; j++) {
+        if (videos[j].webkitPresentationMode === 'picture-in-picture') return 'picture-in-picture';
+      }
+      return 'inline';
+    })();
+    """
+
+    /// Whether a video element is still in picture-in-picture. The document's
+    /// pictureInPictureElement can linger after the window has already closed,
+    /// so it is not the signal — the element's own mode is.
+    static let mode = """
+    (function () {
+      \(Picture.collect)
+      var videos = [];
+      officeCollect(document, videos, 0);
+      for (var i = 0; i < videos.length; i++) {
+        if (videos[i].webkitPresentationMode === 'picture-in-picture') return 'picture-in-picture';
+      }
       return 'inline';
     })();
     """
@@ -721,17 +806,30 @@ enum Isolate {
     /// stream alive where cutting the DOM about would kill it.
     static let on = """
     (function () {
-      var videos = document.querySelectorAll('video');
-      var best = null, area = 0;
-      for (var i = 0; i < videos.length; i++) {
-        var v = videos[i];
-        if (v.paused || v.ended || v.readyState < 2) continue;
-        var box = v.getBoundingClientRect();
-        if (box.width * box.height >= area) { area = box.width * box.height; best = v; }
+      \(Picture.collect)
+      function officePlace(video) {
+        video.setAttribute('data-office-float', '');
+        var props = ['visibility','position','left','top','right','bottom','width','height','max-width','max-height','transform','object-fit','z-index'];
+        var values = ['visible','fixed','0','0','0','0','100vw','100vh','none','none','none','contain','2147483647'];
+        for (var p = 0; p < props.length; p++) video.style.setProperty(props[p], values[p], 'important');
+        var node = video.parentElement || (video.getRootNode && video.getRootNode().host);
+        window.__officeUnclip = [];
+        for (var n = 0; node && n < 16; n++) {
+          try {
+            node.style.setProperty('overflow', 'visible', 'important');
+            window.__officeUnclip.push(node);
+          } catch (e) {}
+          var next = node.parentElement;
+          if (!next && node.getRootNode && node.getRootNode().host) next = node.getRootNode().host;
+          node = next;
+        }
       }
+      var videos = [];
+      officeCollect(document, videos, 0);
+      var best = officeBest(videos);
       if (!best) return 'none';
-
-      best.setAttribute('data-office-float', '');
+      officePlace(best);
+      window.__officeFloatVideo = best;
       var sheet = document.getElementById('office-float');
       if (!sheet) {
         sheet = document.createElement('style');
@@ -783,19 +881,14 @@ enum Isolate {
       // second, for as long as the page is out.
       clearInterval(window.__officeFloatWatch);
       window.__officeFloatWatch = setInterval(function () {
-        if (document.querySelector('[data-office-float]')) return;
-        var again = null, most = 0;
-        var all = document.querySelectorAll('video');
-        for (var j = 0; j < all.length; j++) {
-          var one = all[j];
-          if (one.paused || one.ended || one.readyState < 2) continue;
-          var shape = one.getBoundingClientRect();
-          if (shape.width * shape.height >= most) {
-            most = shape.width * shape.height;
-            again = one;
-          }
-        }
-        if (again) again.setAttribute('data-office-float', '');
+        var held = window.__officeFloatVideo;
+        if (held && held.isConnected && !held.paused && !held.ended && held.getAttribute('data-office-float') != null) return;
+        var found = [];
+        officeCollect(document, found, 0);
+        var again = officeBest(found);
+        if (!again) return;
+        window.__officeFloatVideo = again;
+        officePlace(again);
       }, 250);
 
       return 'floating';
@@ -807,8 +900,10 @@ enum Isolate {
     static func skip(_ seconds: Double) -> String {
         """
         (function () {
-          var video = document.querySelector('[data-office-float]')
-            || document.querySelector('video');
+          var video = window.__officeFloatVideo;
+          if (!video || !video.isConnected) {
+            video = document.querySelector('[data-office-float]') || document.querySelector('video');
+          }
           if (!video) return false;
           video.currentTime = Math.max(0, video.currentTime + (\(seconds)));
           return true;
@@ -819,8 +914,10 @@ enum Isolate {
     /// How far through, and whether it is running.
     static let where_ = """
     (function () {
-      var video = document.querySelector('[data-office-float]')
-        || document.querySelector('video');
+      var video = window.__officeFloatVideo;
+      if (!video || !video.isConnected) {
+        video = document.querySelector('[data-office-float]') || document.querySelector('video');
+      }
       if (!video || !video.duration || !isFinite(video.duration)) return [0, true];
       return [video.currentTime / video.duration, !video.paused];
     })();
@@ -828,8 +925,10 @@ enum Isolate {
 
     static let toggle = """
     (function () {
-      var video = document.querySelector('[data-office-float]')
-        || document.querySelector('video');
+      var video = window.__officeFloatVideo;
+      if (!video || !video.isConnected) {
+        video = document.querySelector('[data-office-float]') || document.querySelector('video');
+      }
       if (!video) return true;
       if (video.paused) { video.play(); } else { video.pause(); }
       return !video.paused;
@@ -838,29 +937,30 @@ enum Isolate {
 
     static let off = """
     (function () {
-      // The engine may have put the video in its own floating window as well —
-      // some players ask for that themselves. Leaving one and not the other
-      // leaves you with two.
+      \(Picture.collect)
+      var props = ['visibility','position','left','top','right','bottom','width','height','max-width','max-height','transform','object-fit','z-index'];
+      function officeClear(video) {
+        if (!video) return;
+        for (var i = 0; i < props.length; i++) video.style.removeProperty(props[i]);
+        video.removeAttribute('data-office-float');
+      }
       try {
-        var out = document.querySelector('video[data-office-float]')
-          || document.querySelector('video');
-        if (out) {
-          if (out.webkitPresentationMode === 'picture-in-picture') {
-            out.webkitSetPresentationMode('inline');
-          }
-          if (document.pictureInPictureElement && document.exitPictureInPicture) {
-            document.exitPictureInPicture();
-          }
-        }
+        var videos = [];
+        officeCollect(document, videos, 0);
+        for (var i = 0; i < videos.length; i++) officeClear(videos[i]);
       } catch (e) {}
-
+      officeClear(window.__officeFloatVideo);
+      var clipped = window.__officeUnclip || [];
+      for (var c = 0; c < clipped.length; c++) {
+        try { clipped[c].style.removeProperty('overflow'); } catch (e) {}
+      }
+      window.__officeUnclip = [];
+      window.__officeFloatVideo = null;
       clearInterval(window.__officeFloatWatch);
       window.__officeFloatWatch = null;
       document.documentElement.classList.remove('office-floating');
       var sheet = document.getElementById('office-float');
       if (sheet) sheet.textContent = '';
-      var video = document.querySelector('[data-office-float]');
-      if (video) video.removeAttribute('data-office-float');
       return 'landed';
     })();
     """

@@ -1,3 +1,5 @@
+Switching away from a playing video opens the Mac's picture-in-picture window. If the page won't allow that, the video floats in Search's own small window instead of disappearing. Coming back to the tab puts the video in the page again.
+
 An update no longer installs itself. A note sits in the bottom left corner until you press Update, and nothing changes until you restart. 
 
 When two Macs disagree, what only one of them has is kept. If both changed the same login, bookmark, or setting, the later change is kept, and a deletion wins only when it happened after that change. Open tabs follow the Mac that changed them last. Saved passwords travel as an encrypted file in iCloud Drive, with the key in iCloud Keychain. A playing video can step out into the Mac's own picture-in-picture window; if a page won't go, it still floats in Search's own small window.
