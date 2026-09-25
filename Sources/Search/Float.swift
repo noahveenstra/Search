@@ -1,18 +1,15 @@
 import AppKit
 import WebKit
 
-// A video that keeps playing after you have gone somewhere else, in a small
-// window that stays above everything — other tabs, and other apps.
+// A video that keeps playing after you have gone somewhere else.
 //
-// WebKit will not hand a video to the system's picture-in-picture without a
-// real click on the page, and nothing the app does counts as one. Chromium is
-// looser, which is why this works elsewhere and refused here.
-//
-// So the engine is not asked. The page itself is moved: everything but the
-// video is made invisible, the video is stretched to fill the viewport, and the
-// whole web view is lifted out of the window and into a small floating one. The
-// video never stops, because it is the same page it always was — it has only
-// changed windows.
+// First choice is the Mac's own picture-in-picture window — the same one
+// Safari uses, which lives outside this app. WebKit only opens it for a
+// click on the page, so the menu and the shortcut hand the call over as a
+// user gesture. When a page still refuses, the page itself is moved: everything
+// but the video is made invisible, the video is stretched to fill the viewport,
+// and the whole web view is lifted into a small floating window. The video
+// never stops, because it is the same page it always was.
 
 @MainActor
 final class Float {
@@ -623,6 +620,88 @@ enum Players {
             guard let needle = entry.path else { return true }
             return path.hasPrefix(needle)
         }
+    }
+}
+
+/// The Mac's picture-in-picture window, asked for by the browser rather than
+/// by a button on the page.
+enum Picture {
+    /// The largest video that is actually playing. 'pending' means the system
+    /// window was asked for; 'none' means there was nothing to ask with.
+    static let enter = """
+    (function () {
+      var videos = document.querySelectorAll('video');
+      var best = null, area = 0;
+      for (var i = 0; i < videos.length; i++) {
+        var v = videos[i];
+        if (v.paused || v.ended || v.readyState < 2) continue;
+        var box = v.getBoundingClientRect();
+        if (box.width * box.height >= area) { area = box.width * box.height; best = v; }
+      }
+      if (!best) return 'none';
+      try {
+        if (best.webkitSetPresentationMode && (!best.webkitSupportsPresentationMode || best.webkitSupportsPresentationMode('picture-in-picture'))) {
+          best.webkitSetPresentationMode('picture-in-picture');
+          return 'pending';
+        }
+      } catch (e) {}
+      try {
+        if (best.requestPictureInPicture) { best.requestPictureInPicture(); return 'pending'; }
+      } catch (e) {}
+      return 'none';
+    })();
+    """
+
+    static let exit = """
+    (function () {
+      var videos = document.querySelectorAll('video');
+      for (var i = 0; i < videos.length; i++) {
+        var v = videos[i];
+        try {
+          if (v.webkitPresentationMode === 'picture-in-picture') v.webkitSetPresentationMode('inline');
+        } catch (e) {}
+      }
+      try {
+        if (document.pictureInPictureElement && document.exitPictureInPicture) document.exitPictureInPicture();
+      } catch (e) {}
+      return 'inline';
+    })();
+    """
+
+}
+
+extension WKWebView {
+    /// Runs in the page's own world, and tells WebKit the person asked —
+    /// a menu item is a click, but not one the page saw. False when this
+    /// system has no such call.
+    func evaluateAsUserGesture(_ script: String, then: @escaping (Any?) -> Void) -> Bool {
+        let sel = NSSelectorFromString("_evaluateJavaScript:withSourceURL:inFrame:inContentWorld:withUserGesture:completionHandler:")
+        guard responds(to: sel) else { return false }
+        typealias Block = @convention(block) (Any?, NSError?) -> Void
+        typealias Fn = @convention(c) (AnyObject, Selector, NSString, NSURL?, WKFrameInfo?, WKContentWorld, Bool, Block) -> Void
+        let block: Block = { value, _ in then(value) }
+        unsafeBitCast(method(for: sel), to: Fn.self)(self, sel, script as NSString, nil, nil, .page, true, block)
+        return true
+    }
+
+    func pictureInPictureUpdate() {
+        let sel = NSSelectorFromString("_updateMediaPlaybackControlsManager")
+        guard responds(to: sel) else { return }
+        perform(sel)
+    }
+
+    func pictureInPictureCanToggle() -> Bool {
+        (value(forKey: "_canTogglePictureInPicture") as? NSNumber)?.boolValue ?? false
+    }
+
+    func pictureInPictureIsActive() -> Bool {
+        (value(forKey: "_isPictureInPictureActive") as? NSNumber)?.boolValue ?? false
+    }
+
+    func pictureInPictureToggle() {
+        let sel = NSSelectorFromString("_togglePictureInPicture")
+        guard responds(to: sel) else { return }
+        perform(sel)
     }
 }
 

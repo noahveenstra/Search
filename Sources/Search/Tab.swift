@@ -103,6 +103,14 @@ enum Web {
         // Off by default on macOS, which is why a full-screen button on a video
         // did nothing at all: the page asks, and WebKit refuses without a word.
         config.preferences.isElementFullscreenEnabled = true
+        // The same for the Mac's own picture-in-picture window. Without it a
+        // video reports that it cannot leave the page, and ⇧⌘P has nothing
+        // to hand to the system.
+        let pip = NSSelectorFromString("_setAllowsPictureInPictureMediaPlayback:")
+        if config.preferences.responds(to: pip) {
+            typealias Setter = @convention(c) (AnyObject, Selector, Bool) -> Void
+            unsafeBitCast(config.preferences.method(for: pip), to: Setter.self)(config.preferences, pip, true)
+        }
         // On by default on macOS: a page could open a new tab, and take you
         // to it, whenever it liked — on load, on a timer. Off, window.open
         // works only from a click or a key, as Safari's pop-up blocking has

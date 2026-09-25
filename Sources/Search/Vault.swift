@@ -21,6 +21,9 @@ struct Login: Identifiable, Equatable, Hashable {
     /// written down, is never handed to a page anyone on the way could have
     /// written.
     var clear = false
+    /// When the password itself last changed. Using it to sign in does not
+    /// move this. Sync keeps the later one when two Macs disagree.
+    var changed = Date.distantPast
 
     var id: String { host + "\u{1}" + user }
 }
@@ -111,20 +114,56 @@ enum Vault {
               let user = row[kSecAttrAccount as String] as? String,
               let password = secret(host: host, user: user)
         else { return nil }
-        // The keychain has no "last used" of its own; it rides in the comment.
-        let used = (row[kSecAttrComment as String] as? String)
-            .flatMap(Double.init).map(Date.init(timeIntervalSince1970:))
+        // The keychain has no dates of its own. They ride in the comment:
+        // a JSON stamp now, or — from before that — the last-used time alone,
+        // which is then also the only change date we can give it.
+        let stamp = Self.stamp(from: row[kSecAttrComment as String] as? String)
         let clear = (row[kSecAttrProtocol as String] as? String) == (kSecAttrProtocolHTTP as String)
-        return Login(host: host, user: user, password: password, used: used, clear: clear)
+        return Login(
+            host: host, user: user, password: password,
+            used: stamp.used, clear: clear, changed: stamp.changed
+        )
+    }
+
+    private struct Stamp: Codable {
+        var changed: Date
+        var used: Date?
+    }
+
+    private static func stamp(from comment: String?) -> Stamp {
+        guard let comment, !comment.isEmpty else { return Stamp(changed: .distantPast, used: nil) }
+        if comment.hasPrefix("{"),
+           let data = comment.data(using: .utf8),
+           let stamp = try? JSONDecoder().decode(Stamp.self, from: data) {
+            return stamp
+        }
+        if let number = Double(comment) {
+            let date = Date(timeIntervalSince1970: number)
+            return Stamp(changed: date, used: date)
+        }
+        return Stamp(changed: .distantPast, used: nil)
+    }
+
+    private static func comment(changed: Date, used: Date?) -> String {
+        let data = (try? JSONEncoder().encode(Stamp(changed: changed, used: used))) ?? Data()
+        return String(data: data, encoding: .utf8) ?? ""
     }
 
     // MARK: - writing
 
+    /// `keepChanged` is for signing in, and for writing a login that already
+    /// has a date from another Mac. A person saving or changing a password
+    /// leaves it false, and the date becomes now.
     @discardableResult
-    static func save(host: String, user: String, password: String, used: Date? = nil, clear: Bool = false) -> Bool {
+    static func save(
+        host: String, user: String, password: String,
+        used: Date? = nil, clear: Bool = false,
+        changed: Date? = nil, keepChanged: Bool = false, quiet: Bool = false
+    ) -> Bool {
         guard !host.isEmpty, !password.isEmpty,
               let data = password.data(using: .utf8)
         else { return false }
+        let when = keepChanged ? (changed ?? .distantPast) : Date()
 
         // Ours only. Server and account alone also match what other apps
         // keep for the same site — git's token for github.com under your
@@ -145,31 +184,41 @@ enum Vault {
             kSecAttrAuthenticationType as String: kSecAttrAuthenticationTypeHTMLForm,
             kSecAttrProtocol as String: clear ? kSecAttrProtocolHTTP : kSecAttrProtocolHTTPS,
         ]
-        if let used { fields[kSecAttrComment as String] = String(used.timeIntervalSince1970) }
+        fields[kSecAttrComment as String] = comment(changed: when, used: used)
 
         let status = SecItemUpdate(identity as CFDictionary, fields as CFDictionary)
-        if status == errSecSuccess { return true }
+        if status == errSecSuccess {
+            if !quiet { CloudSync.shared.notice() }
+            return true
+        }
         guard status == errSecItemNotFound else { return false }
 
         var fresh = identity.merging(fields) { _, new in new }
         fresh[kSecAttrSynchronizable as String] = kCFBooleanTrue
         fresh[kSecAttrAccessible as String] = kSecAttrAccessibleWhenUnlocked
-        return SecItemAdd(fresh as CFDictionary, nil) == errSecSuccess
+        let added = SecItemAdd(fresh as CFDictionary, nil) == errSecSuccess
+        if added, !quiet { CloudSync.shared.notice() }
+        return added
     }
 
-    /// It was just used to sign in. Lists put it first from now on.
+    /// It was just used to sign in. Lists put it first from now on. The
+    /// password did not change, so neither does the date sync compares.
     static func touch(_ login: Login) {
-        save(host: login.host, user: login.user, password: login.password, used: Date(), clear: login.clear)
+        save(
+            host: login.host, user: login.user, password: login.password,
+            used: Date(), clear: login.clear, changed: login.changed, keepChanged: true
+        )
     }
 
-    static func forget(host: String, user: String) {
-        SecItemDelete([
+    static func forget(host: String, user: String, quiet: Bool = false) {
+        let status = SecItemDelete([
             kSecClass as String: kSecClassInternetPassword,
             kSecAttrServer as String: host,
             kSecAttrAccount as String: user,
             kSecAttrLabel as String: label,
             kSecAttrSynchronizable as String: kSecAttrSynchronizableAny,
         ] as CFDictionary)
+        if status == errSecSuccess, !quiet { CloudSync.shared.notice() }
     }
 
     /// Copies passwords saved before syncing into iCloud Keychain, so the
@@ -184,7 +233,11 @@ enum Vault {
                 kSecAttrAccount as String: login.user,
                 kSecAttrLabel as String: label,
             ] as CFDictionary)
-            _ = save(host: login.host, user: login.user, password: login.password, used: login.used, clear: login.clear)
+            _ = save(
+                host: login.host, user: login.user, password: login.password,
+                used: login.used, clear: login.clear, changed: login.changed,
+                keepChanged: true, quiet: true
+            )
         }
     }
 
@@ -194,7 +247,10 @@ enum Vault {
 
     static var never: Set<String> {
         get { Set(Store.settings.stringArray(forKey: neverKey) ?? []) }
-        set { Store.settings.set(Array(newValue).sorted(), forKey: neverKey) }
+        set {
+            Store.settings.set(Array(newValue).sorted(), forKey: neverKey)
+            if !Store.testing { CloudSync.shared.notice() }
+        }
     }
 
     static func never(_ host: String) { never.insert(host) }

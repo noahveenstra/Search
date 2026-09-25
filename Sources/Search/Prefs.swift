@@ -206,7 +206,9 @@ final class Preferences: ObservableObject {
     /// Off unless asked for.
     @Published var usesSpaces: Bool {
         didSet {
+            guard usesSpaces != oldValue else { return }
             store.set(usesSpaces, forKey: "spaces")
+            store.set(Date(), forKey: "sync.spacesAt")
             CloudSync.shared.notice()
         }
     }

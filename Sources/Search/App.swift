@@ -88,7 +88,7 @@ struct SearchApp: App {
                     .keyboardShortcut("r")
                 Button("Reading Mode") { browser.toggleReader() }
                     .keyboardShortcut("r", modifiers: [.command, .shift])
-                Button("Float Video") { browser.toggleFloat() }
+                Button("Picture in Picture") { browser.toggleFloat() }
                     .keyboardShortcut("p", modifiers: [.command, .shift])
                 Divider()
                 Button("Hide Elements…") { browser.toggleHiding() }

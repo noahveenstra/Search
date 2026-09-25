@@ -164,6 +164,8 @@ final class Extensions: NSObject, ObservableObject {
     func adoptSyncedCopies() {
         installed = (try? JSONDecoder().decode([Installed].self, from: Data(contentsOf: Extensions.list))) ?? []
         guard !contexts.isEmpty else { return }
+        let live = Set(installed.filter(\.enabled).map(\.id))
+        for id in contexts.keys where !live.contains(id) { unload(id) }
         let known = Set(contexts.keys)
         Task {
             for item in installed where item.enabled && !known.contains(item.id) {

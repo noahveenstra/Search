@@ -156,12 +156,14 @@ struct SettingsPanel: View {
 
     private var syncCard: some View {
         Card {
-            Line(
-                "Sync this browser",
-                sync.detail + " Passwords follow through iCloud Keychain."
-            ) {
+            Line("Sync this browser", sync.detail) {
                 Switch(on: $sync.enabled)
             }
+            Rule()
+            Line(
+                "When two Macs disagree",
+                "What only one Mac has is kept. If both changed the same login or bookmark, the later change is kept. Tabs follow the Mac that changed them last."
+            ) { EmptyView() }
         }
     }
 
@@ -242,15 +244,15 @@ struct SettingsPanel: View {
                 Switch(on: $prefs.fastPages)
             }
             Rule()
-            Line("Flick the floating video to a corner", "Two fingers on it send it to the corner or edge they point at, instead of pushing it along. Dragging still puts it anywhere") {
+            Line("Flick the floating video to a corner", "For a video the Mac's own picture in picture can't take. Two fingers send that window to the corner they point at") {
                 Switch(on: $prefs.floatFlicks)
             }
             Rule()
-            Line("Float the video when you switch tabs", "A video playing on YouTube and the like comes out into its floating window when you go to another tab, and back when you return. ⇧⌘P still floats one by hand") {
+            Line("Picture in picture when you switch tabs", "A video on YouTube and the like goes into the Mac's picture in picture when you change tabs, and back when you return. ⇧⌘P still does it by hand") {
                 Switch(on: $prefs.floatsOnLeave)
             }
             Rule()
-            Line("Float the video when you switch apps", "A video playing on the site you're on comes out into its floating window as another app comes to the front, and goes back into its tab when you return") {
+            Line("Picture in picture when you switch apps", "A video playing on the site you're on goes into the Mac's picture in picture as another app comes forward, and back into its tab when you return") {
                 Switch(on: $prefs.floatsAway)
             }
             Rule()

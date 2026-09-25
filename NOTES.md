@@ -1,3 +1,5 @@
+When two Macs disagree, what only one of them has is kept. If both changed the same login, bookmark, or setting, the later change is kept, and a deletion wins only when it happened after that change. Open tabs follow the Mac that changed them last. Saved passwords travel as an encrypted file in iCloud Drive, with the key in iCloud Keychain. A playing video can step out into the Mac's own picture-in-picture window; if a page won't go, it still floats in Search's own small window.
+
 The top of the window, in the sidebar layout, can be taken hold of across a taller invisible band. Nothing new is drawn there.
 
 Sync. Tabs, history, bookmarks, spaces, extensions and cookies follow you to the other Macs on your iCloud account. Passwords go through iCloud Keychain. Turn it off in Settings › General. Nothing is stored in the GitHub repository.

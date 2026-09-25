@@ -30,6 +30,17 @@ final class Browser: NSObject, ObservableObject {
         }
     }
 
+    /// The tab whose video is in the Mac's picture-in-picture window.
+    /// The page stays put; only the video leaves.
+    private(set) var nativePiP: Tab.ID?
+    /// The ask currently in flight, so a late answer can't open a second window.
+    private var pipToken: UUID?
+    /// What to do once that ask finishes. A tab change waits here: taking the
+    /// page off screen before the system window is up leaves the video inline.
+    private var pipDone: (() -> Void)?
+    /// The ask was because another app came forward. Coming back first cancels it.
+    private var pipForAway = false
+
     /// Everything there is to set. Held here so the whole window redraws when
     /// one of them changes.
     let prefs = Preferences()
@@ -1002,7 +1013,7 @@ final class Browser: NSObject, ObservableObject {
         let have = tabs.compactMap { ($0.pending ?? $0.address)?.absoluteString }
         if incoming == have { return }
         suppressSession = true
-        if floating != nil { land() }
+        if floating != nil || nativePiP != nil { land() }
         for tab in tabs { tab.close() }
         tabs = []
         activeID = nil
@@ -1089,25 +1100,30 @@ final class Browser: NSObject, ObservableObject {
             if let end = tabs.indices.last, tabs.firstIndex(where: { $0.id == blank.id }) != end {
                 move(blank, to: end)
             }
-            if activeID != blank.id { leaving() }
-            activeID = blank.id
-            summoning = false
-            typed = ""
-            editing = false
-            focusRequest += 1
-            rememberSession()
+            let show = { [weak self] in
+                guard let self else { return }
+                self.activeID = blank.id
+                self.summoning = false
+                self.typed = ""
+                self.editing = false
+                self.focusRequest += 1
+                self.rememberSession()
+            }
+            if activeID != blank.id { leaving(then: show) } else { show() }
             return
         }
         let tab = Tab()
         adopt(tab)
-        leaving()
-        activeID = tab.id
-        summoning = false
-        typed = ""
-        editing = false
-        focusRequest += 1
-        rememberSession()
-        if #available(macOS 15.4, *) { Extensions.shared.offerNewTabPage(into: tab) }
+        leaving { [weak self] in
+            guard let self else { return }
+            self.activeID = tab.id
+            self.summoning = false
+            self.typed = ""
+            self.editing = false
+            self.focusRequest += 1
+            self.rememberSession()
+            if #available(macOS 15.4, *) { Extensions.shared.offerNewTabPage(into: tab) }
+        }
     }
 
     /// A blank tab given an extension's new tab page: the page needs a view
@@ -1129,21 +1145,28 @@ final class Browser: NSObject, ObservableObject {
         cancelTabEdit()
         summoning = false
         suggesting = nil
-        guard tab.id != activeID else { return }
+        guard tab.id != activeID else {
+            // Still here: a switch that was waiting on picture in picture is
+            // no longer wanted, and the video stays in the page.
+            if pipToken != nil { land() }
+            return
+        }
         // Coming back to the tab whose video is out brings it home first, so
         // it is never lifted and landed in the same breath.
-        if floating == tab.id { land() }
-        leaving()
-        activeID = tab.id
-        tab.touch()
-        // A tab brought back from last time, or waking from ⌘W while pinned,
-        // opens the moment you look at it — and only if there was nothing to
-        // wake is this the other case, one whose page quietly died while you
-        // were elsewhere, which revive() checks for on its own.
-        if !tab.wake() { tab.revive() }
-        rememberSession()
-        editing = false
-        typed = ""
+        if floating == tab.id || nativePiP == tab.id { land() }
+        leaving { [weak self] in
+            guard let self, self.tabs.contains(where: { $0.id == tab.id }) else { return }
+            self.activeID = tab.id
+            tab.touch()
+            // A tab brought back from last time, or waking from ⌘W while pinned,
+            // opens the moment you look at it — and only if there was nothing to
+            // wake is this the other case, one whose page quietly died while you
+            // were elsewhere, which revive() checks for on its own.
+            if !tab.wake() { tab.revive() }
+            self.rememberSession()
+            self.editing = false
+            self.typed = ""
+        }
     }
 
     /// ⌘W, or the cross on the tab. Closing the last one leaves a blank tab
@@ -1153,8 +1176,9 @@ final class Browser: NSObject, ObservableObject {
 
         // A tab whose page is out in the little window takes the window with
         // it. Left alone, the window would go on holding a page belonging to a
-        // tab that no longer exists.
-        if floating == tab.id { land() }
+        // tab that no longer exists. Closing the tab an ask is still using
+        // cancels that ask too, or a late answer would lift a page already gone.
+        if floating == tab.id || nativePiP == tab.id || (pipToken != nil && tab.id == activeID) { land() }
 
         // A pinned tab is not closed by ⌘W — it is put down. The letter keeps
         // its place, the page is let go, and you land on whatever you were
@@ -1246,12 +1270,16 @@ final class Browser: NSObject, ObservableObject {
         ghosts.removeAll { $0.id == ghost.id }
         let tab = Tab()
         prepare(tab)
-        leaving()
-        tabs.insert(tab, at: min(ghost.index, tabs.count))
-        activeID = tab.id
-        editing = false
-        typed = ""
-        tab.go(to: ghost.url)
+        let index = ghost.index
+        let url = ghost.url
+        leaving { [weak self] in
+            guard let self else { return }
+            self.tabs.insert(tab, at: min(index, self.tabs.count))
+            self.activeID = tab.id
+            self.editing = false
+            self.typed = ""
+            tab.go(to: url)
+        }
     }
 
     private func remember(_ tab: Tab, at index: Int) {
@@ -1306,10 +1334,12 @@ final class Browser: NSObject, ObservableObject {
         tabs.insert(tab, at: atEnd ? tabs.count : placeForNew())
         tab.go(to: url)
         if foreground {
-            leaving()
-            activeID = tab.id
-            editing = false
-            typed = ""
+            leaving { [weak self] in
+                guard let self else { return }
+                self.activeID = tab.id
+                self.editing = false
+                self.typed = ""
+            }
         }
         return tab
     }
@@ -1420,23 +1450,28 @@ final class Browser: NSObject, ObservableObject {
             if let end = tabs.indices.last, tabs.firstIndex(where: { $0.id == blank.id }) != end {
                 move(blank, to: end)
             }
-            if activeID != blank.id { leaving() }
-            activeID = blank.id
-            summoning = false
-            typed = ""
-            editing = false
-            focusRequest += 1
+            let show = { [weak self] in
+                guard let self else { return }
+                self.activeID = blank.id
+                self.summoning = false
+                self.typed = ""
+                self.editing = false
+                self.focusRequest += 1
+            }
+            if activeID != blank.id { leaving(then: show) } else { show() }
             return
         }
         let tab = Tab(shy: true)
         adopt(tab)
-        leaving()
-        activeID = tab.id
-        summoning = false
-        typed = ""
-        editing = false
-        focusRequest += 1
-        announce("A tab that keeps nothing")
+        leaving { [weak self] in
+            guard let self else { return }
+            self.activeID = tab.id
+            self.summoning = false
+            self.typed = ""
+            self.editing = false
+            self.focusRequest += 1
+            self.announce("A tab that keeps nothing")
+        }
     }
 
     /// ⌘D. The same page, beside itself.
@@ -1517,10 +1552,21 @@ final class Browser: NSObject, ObservableObject {
     }
 
     /// Stepping away from a tab. A video you were watching does not stop
-    /// existing because you went to look something up.
-    private func leaving() {
-        guard prefs.floatsOnLeave else { return }
-        lift(active, quietly: true)
+    /// existing because you went to look something up. `then` runs once the
+    /// page can leave the screen — at once, unless the Mac's picture in
+    /// picture window still needs the page where it is.
+    private func leaving(then commit: @escaping () -> Void) {
+        guard let tab = active else { commit(); return }
+        if nativePiP == tab.id {
+            commit()
+            return
+        }
+        guard prefs.floatsOnLeave, !floater.showing else { commit(); return }
+        if pipToken != nil {
+            pipDone = commit
+            return
+        }
+        lift(tab, quietly: true, then: commit)
     }
 
     /// Another app in front: the video comes along, as in Arc (Settings ›
@@ -1534,45 +1580,169 @@ final class Browser: NSObject, ObservableObject {
 
     func appLeft() {
         guard prefs.floatsAway, Browser.front == nil || Browser.front === self else { return }
-        liftedAway = !floater.showing
+        guard nativePiP == nil, !floater.showing, pipToken == nil else { return }
+        liftedAway = true
+        pipForAway = true
         lift(active, quietly: true)
     }
 
     /// Back, and still on the tab it came from: into the tab again.
+    /// Coming back before the system window has opened cancels the ask.
     func appBack() {
-        defer { liftedAway = false }
-        if liftedAway, let id = floating, id == activeID { land() }
+        let away = liftedAway
+        liftedAway = false
+        guard away else { return }
+        if pipToken != nil, pipForAway, pipDone == nil {
+            pipForAway = false
+            pipToken = nil
+            if let web = active?.built { stopPicture(web) }
+            return
+        }
+        pipForAway = false
+        if let id = floating ?? nativePiP, id == activeID { land() }
     }
 
-    /// ⌘⇧P, for lifting one out by hand.
+    /// ⇧⌘P, for lifting one out by hand.
     func toggleFloat() {
-        if floater.showing {
+        if floater.showing || nativePiP != nil || pipToken != nil {
             land()
             return
         }
         lift(active, quietly: false)
     }
 
-    /// Everything but the video goes out of the way, and the page it lives in
-    /// moves house — into a small window that stays above everything.
-    private func lift(_ tab: Tab?, quietly: Bool) {
+    /// The Mac's picture-in-picture window when it will take the video, and
+    /// the in-app window when it won't. The page stays on screen until the
+    /// system window is actually up — moving it sooner leaves the video inline.
+    private func lift(_ tab: Tab?, quietly: Bool, then: (() -> Void)? = nil) {
         // A tab just put down with ⌘W has no page to lift a video out of, and
         // asking it would only build an empty view to ask.
-        guard let tab, !tab.isBlank, !tab.asleep, !floater.showing else { return }
+        guard let tab, !tab.isBlank, !tab.asleep, !floater.showing, tab.built != nil else {
+            then?()
+            return
+        }
+        if nativePiP == tab.id {
+            then?()
+            return
+        }
         // On its own, only from a site whose video is the point of the site.
         // A hero background on a studio's home page is a video too, and it
-        // followed people around the desktop. ⌘⇧P still lifts from anywhere.
-        if quietly, !Players.knows(tab.address) { return }
+        // followed people around the desktop. ⇧⌘P still lifts from anywhere.
+        if quietly, !Players.knows(tab.address) {
+            then?()
+            return
+        }
+        if pipToken != nil {
+            if let then { pipDone = then }
+            return
+        }
+        let token = UUID()
+        pipToken = token
+        pipDone = then
+        attemptPicture(tab, token: token, quietly: quietly, round: 1)
+        // A page that never answers must not hold the tab change forever.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 5) { [weak self] in
+            self?.fallbackPicture(tab, token: token, quietly: quietly)
+        }
+    }
+
+    /// One try: ask the page, then the WebKit control that actually opens the
+    /// system window. A few tries, a second apart, is what makes it stick.
+    private func attemptPicture(_ tab: Tab, token: UUID, quietly: Bool, round: Int) {
+        guard pipToken == token, let web = tab.built else { return }
+        if web.pictureInPictureIsActive() || nativePiP == tab.id {
+            endPictureAsk(opened: true, tab: tab)
+            return
+        }
+        web.pictureInPictureUpdate()
+        let asked = web.evaluateAsUserGesture(Picture.enter) { [weak self] value in
+            Task { @MainActor in
+                self?.pictureEntered(value, tab: tab, token: token, quietly: quietly, round: round)
+            }
+        }
+        if !asked { fallbackPicture(tab, token: token, quietly: quietly) }
+    }
+
+    private func pictureEntered(_ value: Any?, tab: Tab, token: UUID, quietly: Bool, round: Int) {
+        guard pipToken == token else { return }
+        if (value as? String) == "none" {
+            if quietly {
+                endPictureAsk(opened: false, tab: tab)
+            } else {
+                fallbackPicture(tab, token: token, quietly: quietly)
+            }
+            return
+        }
+        if tab.built?.pictureInPictureIsActive() == true || nativePiP == tab.id {
+            endPictureAsk(opened: true, tab: tab)
+            return
+        }
+        tab.built?.pictureInPictureToggle()
+        watchPicture(tab, token: token, quietly: quietly, round: round, polls: 0)
+    }
+
+    private func watchPicture(_ tab: Tab, token: UUID, quietly: Bool, round: Int, polls: Int) {
+        guard pipToken == token else { return }
+        if tab.built?.pictureInPictureIsActive() == true || nativePiP == tab.id {
+            endPictureAsk(opened: true, tab: tab)
+            return
+        }
+        if polls < 4 {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { [weak self] in
+                self?.watchPicture(tab, token: token, quietly: quietly, round: round, polls: polls + 1)
+            }
+            return
+        }
+        if round < 3 {
+            attemptPicture(tab, token: token, quietly: quietly, round: round + 1)
+            return
+        }
+        fallbackPicture(tab, token: token, quietly: quietly)
+    }
+
+    private func endPictureAsk(opened: Bool, tab: Tab) {
+        guard pipToken != nil else {
+            if opened { nativePiP = tab.id }
+            return
+        }
+        pipToken = nil
+        if opened { nativePiP = tab.id }
+        let done = pipDone
+        pipDone = nil
+        done?()
+    }
+
+    private func fallbackPicture(_ tab: Tab, token: UUID, quietly: Bool) {
+        guard pipToken == token else { return }
+        if tab.built?.pictureInPictureIsActive() == true || nativePiP == tab.id {
+            endPictureAsk(opened: true, tab: tab)
+            return
+        }
+        pipToken = nil
+        let done = pipDone
+        pipDone = nil
+        // The system window never appeared. Put the video back inline before
+        // the in-app window takes the page, or it plays to a black box.
+        tab.built?.evaluateJavaScript(Picture.exit, in: nil, in: .page)
+        liftInApp(tab, quietly: quietly, then: done)
+    }
+
+    /// Everything but the video goes out of the way, and the page it lives in
+    /// moves house — into a small window that stays above everything.
+    private func liftInApp(_ tab: Tab, quietly: Bool, then: (() -> Void)? = nil) {
+        guard !floater.showing, nativePiP == nil else { then?(); return }
         tab.web.evaluateInSearch(Isolate.on) { [weak self] answer in
-            MainActor.assumeIsolated {
-                guard let self else { return }
+            Task { @MainActor in
+                guard let self else { then?(); return }
                 guard (answer as? String) == "floating" else {
                     if !quietly { self.announce("Nothing is playing here") }
+                    then?()
                     return
                 }
                 self.floating = tab.id
                 tab.floating = true
                 self.floater.lift(tab.web)
+                then?()
             }
         }
     }
@@ -1582,11 +1752,34 @@ final class Browser: NSObject, ObservableObject {
     func land() {
         // The window closes whatever else is true. Tying that to the bookkeeping
         // is how a little window outlives the thing that opened it.
+        let pending = pipToken != nil
+        pipToken = nil
+        pipDone = nil
+        pipForAway = false
         if floater.showing { floater.drop() }
+        if let id = nativePiP, let tab = tabs.first(where: { $0.id == id }) {
+            if let web = tab.built { stopPicture(web) }
+            nativePiP = nil
+        } else if pending, let web = active?.built {
+            stopPicture(web)
+        }
         guard let id = floating, let tab = tabs.first(where: { $0.id == id }) else { return }
         floating = nil
         tab.floating = false
         tab.web.evaluateInSearch(Isolate.off)
+    }
+
+    /// Leaves the Mac's picture-in-picture window. The page is asked first;
+    /// the WebKit control is the backup when that ask cannot be sent.
+    private func stopPicture(_ web: WKWebView) {
+        let asked = web.evaluateAsUserGesture(Picture.exit) { _ in
+            Task { @MainActor in
+                if web.pictureInPictureIsActive() { web.pictureInPictureToggle() }
+            }
+        }
+        if !asked, web.pictureInPictureIsActive() {
+            web.pictureInPictureToggle()
+        }
     }
 
     func prepare(_ tab: Tab) {
@@ -1918,6 +2111,22 @@ final class Browser: NSObject, ObservableObject {
 // MARK: - WebKit
 
 extension Browser: WKNavigationDelegate, WKUIDelegate {
+    /// WebKit's own word that the system picture-in-picture window opened or
+    /// closed — including when the person closes it from that window.
+    @objc(_webView:hasVideoInPictureInPictureDidChange:)
+    func _webView(_ webView: WKWebView, hasVideoInPictureInPictureDidChange active: Bool) {
+        guard let tab = tabs.first(where: { $0.built === webView }) else { return }
+        if active {
+            if pipToken != nil {
+                endPictureAsk(opened: true, tab: tab)
+            } else {
+                nativePiP = tab.id
+            }
+        } else if nativePiP == tab.id {
+            nativePiP = nil
+        }
+    }
+
     /// Links the window has no business showing — mail, calls, an app's own
     /// scheme — are handed to whoever does own them.
     func webView(

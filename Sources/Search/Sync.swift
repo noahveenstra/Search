@@ -1,18 +1,22 @@
 import CryptoKit
 import Foundation
+import Security
 import WebKit
 
 // One person's browser, on every Mac signed into the same iCloud account.
 //
 // The GitHub repository is the app. This is the browsing: tabs, history,
-// bookmarks, spaces, what is hidden, extensions, cookies, and — through
-// iCloud Keychain, not this folder — passwords. Nothing here is committed
-// or released. A test run never reaches it.
+// bookmarks, spaces, what is hidden, extensions, cookies, and passwords.
+// Passwords are encrypted in this folder; the key lives in iCloud Keychain,
+// not in the file. Nothing here is committed or released. A test run never
+// reaches it.
 //
-// Each kind of file is merged, not replaced. A bookmark saved on one Mac
-// and a page visited on the other both survive. The open tabs of a space
-// follow whichever Mac touched that space last, and an identical row is
-// left alone so two Macs don't hand the same tabs back and forth.
+// When the two Macs don't match, the rule is the same for all of it.
+// Something only one Mac has is kept. The same thing changed on both keeps
+// the later change, and a deletion wins only when it is later than that
+// change. Open tabs are the exception: the Mac that last touched that
+// space's tabs wins, because closing a tab is a choice. An identical row
+// is left alone so two Macs don't hand the same tabs back and forth.
 
 @MainActor
 final class CloudSync: ObservableObject {
@@ -94,9 +98,13 @@ final class CloudSync: ObservableObject {
         if changed.prefs, let prefs = changed.prefsBody { apply(prefs) }
         for space in changed.sessions { browser?.adoptSyncedSession(space) }
         if changed.extensions, #available(macOS 15.4, *) { Extensions.shared.adoptSyncedCopies() }
+        if changed.logins { browser?.relist() }
         let jars = changed.cookies
         Task { await Self.syncCookieJars(pull: jars, cloud: cloud) }
         detail = Self.describe(cloud: cloud)
+        if changed.passwordKeyMissing {
+            detail += " Saved passwords are waiting for iCloud Keychain."
+        }
         working = false
         if again { again = false; schedule() }
     }
@@ -166,6 +174,8 @@ final class CloudSync: ObservableObject {
         var prefsBody: PrefBody?
         var sessions: [UUID] = []
         var cookies: [String] = []
+        var logins = false
+        var passwordKeyMissing = false
     }
 
     /// `browser` is nil in the check that runs without opening a window.
@@ -190,7 +200,12 @@ final class CloudSync: ObservableObject {
         changed.hidden = mergeHidden(local: local, cloud: cloud, device: device, state: &state)
         changed.extensions = mergeExtensions(local: local, cloud: cloud, state: &state)
         changed.sessions = mergeSessions(local: local, cloud: cloud, device: device, state: &state)
-        if browser != nil { changed.cookies = mergeCookies(local: local, cloud: cloud, device: device, state: &state) }
+        if browser != nil {
+            changed.cookies = mergeCookies(local: local, cloud: cloud, device: device, state: &state)
+            let passwords = mergePasswords(cloud: cloud, state: &state)
+            changed.logins = passwords.changed
+            changed.passwordKeyMissing = passwords.waiting
+        }
         return changed
     }
 
@@ -406,25 +421,96 @@ final class CloudSync: ObservableObject {
     struct PrefBody: Codable, Equatable {
         var spaces: Bool
         var never: [String]
+        /// When the spaces switch last moved. Missing in a file written
+        /// before it was kept; the file's own date stands in.
+        var spacesAt: Date?
+        /// When each "never ask" site was added. A site only one Mac has
+        /// is kept; a removal wins only if it is later than the add.
+        var neverAt: [String: Date]?
+
+        enum CodingKeys: String, CodingKey {
+            case spaces, never, spacesAt, neverAt
+        }
+
+        init(spaces: Bool, never: [String], spacesAt: Date?, neverAt: [String: Date]?) {
+            self.spaces = spaces
+            self.never = never
+            self.spacesAt = spacesAt
+            self.neverAt = neverAt
+        }
+
+        init(from decoder: Decoder) throws {
+            let c = try decoder.container(keyedBy: CodingKeys.self)
+            spaces = try c.decode(Bool.self, forKey: .spaces)
+            never = try c.decodeIfPresent([String].self, forKey: .never) ?? []
+            spacesAt = try c.decodeIfPresent(Date.self, forKey: .spacesAt)
+            neverAt = try c.decodeIfPresent([String: Date].self, forKey: .neverAt)
+        }
+
+        func encode(to encoder: Encoder) throws {
+            var c = encoder.container(keyedBy: CodingKeys.self)
+            try c.encode(spaces, forKey: .spaces)
+            try c.encode(never, forKey: .never)
+            try c.encodeIfPresent(spacesAt, forKey: .spacesAt)
+            try c.encodeIfPresent(neverAt, forKey: .neverAt)
+        }
+    }
+
+    /// Sites told "never ask", from both Macs. A removal is a date in `gone`.
+    static func mergeNever(
+        _ local: [String], _ remote: [String],
+        localAt: [String: Date], remoteAt: [String: Date], gone: [String: Date]
+    ) -> [String] {
+        var kept: [String] = []
+        for host in Set(local).union(remote) {
+            let latest = max(localAt[host] ?? .distantPast, remoteAt[host] ?? .distantPast)
+            if let when = gone[host], when >= latest { continue }
+            kept.append(host)
+        }
+        return kept.sorted()
     }
 
     private static func mergePrefs(local: URL, cloud: URL, device: String, state: inout State) -> PrefBody? {
         let file = local.appendingPathComponent("prefs-sync.json")
         let remoteURL = cloud.appendingPathComponent("prefs.json")
-        let onDisk = decode(PrefBody.self, file)
+        let neverNow = (Store.settings.stringArray(forKey: Vault.neverKey) ?? []).sorted()
         let current = PrefBody(
             spaces: Store.settings.bool(forKey: "spaces"),
-            never: (Store.settings.stringArray(forKey: Vault.neverKey) ?? []).sorted()
+            never: neverNow,
+            spacesAt: Store.settings.object(forKey: "sync.spacesAt") as? Date,
+            neverAt: state.neverStamps
         )
         let remote = decode(Marked<PrefBody>.self, remoteURL)
-        let localBody = onDisk ?? current
         let localDate = (try? file.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? .distantPast
-        let chosen = localDate >= (remote?.updated ?? .distantPast) ? localBody : (remote?.body ?? localBody)
-        // What the person just set beats a file we haven't written yet.
-        let body = current == localBody || onDisk == nil ? chosen : current
+        var gone = remote?.gone ?? [:]
+        if !state.neverKeys.isEmpty {
+            for host in state.neverKeys where !neverNow.contains(host) { gone[host] = Date() }
+        }
+        var localAt = state.neverStamps
+        for host in neverNow where !state.neverKeys.contains(host) { localAt[host] = Date() }
+        let remoteAt = remote?.body.neverAt ?? Dictionary(
+            uniqueKeysWithValues: (remote?.body.never ?? []).map { ($0, remote?.updated ?? .distantPast) }
+        )
+        let never = mergeNever(neverNow, remote?.body.never ?? [], localAt: localAt, remoteAt: remoteAt, gone: gone)
+        var stamps: [String: Date] = [:]
+        for host in never {
+            stamps[host] = max(localAt[host] ?? .distantPast, remoteAt[host] ?? .distantPast)
+        }
+        let localSpacesAt = current.spacesAt ?? localDate
+        let remoteSpacesAt = remote?.body.spacesAt ?? remote?.updated ?? .distantPast
+        let spaces = localSpacesAt >= remoteSpacesAt ? current.spaces : (remote?.body.spaces ?? current.spaces)
+        let body = PrefBody(
+            spaces: spaces,
+            never: never,
+            spacesAt: max(localSpacesAt, remoteSpacesAt),
+            neverAt: stamps
+        )
         writeIfDifferent(body, file)
-        publish(body, gone: [:], stamps: [:], device: device, url: remoteURL)
-        return body == current ? nil : body
+        publish(body, gone: prune(gone), stamps: [:], device: device, url: remoteURL)
+        state.neverKeys = never
+        state.neverStamps = stamps
+        let same = body.spaces == current.spaces && body.never == current.never
+        return same ? nil : body
     }
 
     // MARK: - tabs
@@ -507,35 +593,154 @@ final class CloudSync: ObservableObject {
         var hash: String
     }
 
+    struct ExtensionNote: Codable, Equatable {
+        var hash: String
+        var updated: Date
+        var record: Installed?
+    }
+
+    struct ExtensionBook: Codable, Equatable {
+        var notes: [String: ExtensionNote]
+        var gone: [String: Date]
+    }
+
+    enum ExtensionSide: Equatable { case local, remote, drop }
+
+    /// One extension only one Mac installed is kept. The same extension
+    /// changed on both keeps the later copy. A removal wins only when it
+    /// is later than both copies.
+    static func chooseExtensions(
+        local: [String: ExtensionNote], remote: [String: ExtensionNote], gone: [String: Date]
+    ) -> [String: ExtensionSide] {
+        var out: [String: ExtensionSide] = [:]
+        for id in Set(local.keys).union(remote.keys) {
+            let left = local[id]?.updated ?? .distantPast
+            let right = remote[id]?.updated ?? .distantPast
+            if let when = gone[id], when >= left, when >= right {
+                out[id] = .drop
+                continue
+            }
+            switch (local[id], remote[id]) {
+            case (_?, nil): out[id] = .local
+            case (nil, _?): out[id] = .remote
+            case let (l?, r?): out[id] = l.updated >= r.updated ? .local : .remote
+            case (nil, nil): break
+            }
+        }
+        return out
+    }
+
     private static func mergeExtensions(local: URL, cloud: URL, state: inout State) -> Bool {
         let source = local.appendingPathComponent("Extensions", isDirectory: true)
         let dest = cloud.appendingPathComponent("Extensions", isDirectory: true)
-        let stampURL = cloud.appendingPathComponent("extensions.json")
-        let localHash = treeHash(source)
-        let remote = decode(Stamp.self, stampURL)
-        let empty = digest(Data())
-        let localChanged = localHash != state.extensionHash && localHash != "missing"
-        let remoteChanged = remote.map { $0.hash != state.extensionHash && $0.updated > state.extensionSeen } ?? false
-        if (localHash == "missing" || localHash == empty), let remote, remote.hash != empty && remote.hash != "missing" {
-            replaceTree(from: dest, to: source)
-            state.extensionHash = remote.hash
-            state.extensionSeen = remote.updated
-            return true
+        let bookURL = cloud.appendingPathComponent("extensions.json")
+        let localInstalled = readInstalled(source)
+        let remoteInstalled = readInstalled(dest)
+        let book = decode(ExtensionBook.self, bookURL)
+        let legacy = book == nil ? decode(Stamp.self, bookURL) : nil
+        var gone = book?.gone ?? [:]
+        let localIDs = extensionIDs(in: source)
+        if !state.extensionIDs.isEmpty {
+            for id in state.extensionIDs where !localIDs.contains(id) { gone[id] = Date() }
         }
-        if remoteChanged && !localChanged, let remote {
-            replaceTree(from: dest, to: source)
-            state.extensionHash = remote.hash
-            state.extensionSeen = remote.updated
-            return true
+        var localNotes: [String: ExtensionNote] = [:]
+        for id in localIDs {
+            let folder = source.appendingPathComponent(id, isDirectory: true)
+            let hash = treeHash(folder)
+            let folderDate = (try? folder.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? .distantPast
+            let record = localInstalled[id]
+            let signature = record.map { digest(encode($0) ?? Data()) } ?? ""
+            let updated: Date
+            if let prior = state.extensionFolderHashes[id] {
+                let same = prior == hash && state.extensionRecords[id] == signature
+                updated = same ? (state.extensionStamps[id] ?? folderDate) : Date()
+            } else {
+                updated = folderDate
+            }
+            localNotes[id] = ExtensionNote(hash: hash, updated: updated, record: record)
         }
-        if localChanged && localHash != empty && localHash != remote?.hash {
-            replaceTree(from: source, to: dest)
-            let stamp = Stamp(updated: Date(), hash: localHash)
-            put(encode(stamp), stampURL)
-            state.extensionHash = localHash
-            state.extensionSeen = stamp.updated
+        var remoteNotes = book?.notes ?? [:]
+        for id in extensionIDs(in: dest) where remoteNotes[id] == nil {
+            let folder = dest.appendingPathComponent(id, isDirectory: true)
+            let folderDate = (try? folder.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? .distantPast
+            remoteNotes[id] = ExtensionNote(
+                hash: treeHash(folder),
+                updated: legacy.map { max($0.updated, folderDate) } ?? folderDate,
+                record: remoteInstalled[id]
+            )
         }
-        return false
+        let choice = chooseExtensions(local: localNotes, remote: remoteNotes, gone: gone)
+        var changed = false
+        var notes: [String: ExtensionNote] = [:]
+        var records: [String: Installed] = [:]
+        for (id, side) in choice {
+            switch side {
+            case .drop:
+                if FileManager.default.fileExists(atPath: source.appendingPathComponent(id).path) {
+                    try? FileManager.default.removeItem(at: source.appendingPathComponent(id))
+                    changed = true
+                }
+                try? FileManager.default.removeItem(at: dest.appendingPathComponent(id))
+            case .local:
+                copyFolder(id, from: source, to: dest)
+                if let note = localNotes[id] { notes[id] = note }
+                if let record = localInstalled[id] ?? remoteInstalled[id] { records[id] = record }
+            case .remote:
+                copyFolder(id, from: dest, to: source)
+                changed = true
+                if let note = remoteNotes[id] { notes[id] = note }
+                if let record = remoteInstalled[id] ?? localInstalled[id] { records[id] = record }
+            }
+        }
+        let list = records.values.sorted { $0.name < $1.name }
+        if writeIfDifferent(list, source.appendingPathComponent("installed.json")) { changed = true }
+        _ = writeIfDifferent(list, dest.appendingPathComponent("installed.json"))
+        let next = ExtensionBook(notes: notes, gone: prune(gone))
+        if book != next { put(encode(next), bookURL) }
+        state.extensionIDs = notes.keys.sorted()
+        state.extensionFolderHashes = notes.mapValues(\.hash)
+        state.extensionStamps = notes.mapValues(\.updated)
+        state.extensionRecords = records.mapValues { digest(encode($0) ?? Data()) }
+        state.extensionHash = digest(Data(state.extensionIDs.joined(separator: "\n").utf8))
+        state.extensionSeen = notes.values.map(\.updated).max() ?? .distantPast
+        return changed
+    }
+
+    private static func extensionIDs(in root: URL) -> [String] {
+        guard let urls = try? FileManager.default.contentsOfDirectory(
+            at: root, includingPropertiesForKeys: [.isDirectoryKey]
+        ) else { return [] }
+        return urls.compactMap { url in
+            let name = url.lastPathComponent
+            guard !name.hasPrefix("."), name != "installed.json" else { return nil }
+            var directory: ObjCBool = false
+            guard FileManager.default.fileExists(atPath: url.path, isDirectory: &directory), directory.boolValue else { return nil }
+            return name
+        }
+    }
+
+    private static func readInstalled(_ root: URL) -> [String: Installed] {
+        var out: [String: Installed] = [:]
+        for item in decode([Installed].self, root.appendingPathComponent("installed.json")) ?? [] {
+            out[item.id] = item
+        }
+        return out
+    }
+
+    private static func copyFolder(_ id: String, from root: URL, to destRoot: URL) {
+        let source = root.appendingPathComponent(id, isDirectory: true)
+        guard FileManager.default.fileExists(atPath: source.path) else { return }
+        try? FileManager.default.createDirectory(at: destRoot, withIntermediateDirectories: true)
+        let dest = destRoot.appendingPathComponent(id, isDirectory: true)
+        let temporary = destRoot.appendingPathComponent(".next-\(id)")
+        try? FileManager.default.removeItem(at: temporary)
+        do {
+            try FileManager.default.copyItem(at: source, to: temporary)
+            if FileManager.default.fileExists(atPath: dest.path) { try FileManager.default.removeItem(at: dest) }
+            try FileManager.default.moveItem(at: temporary, to: dest)
+        } catch {
+            try? FileManager.default.removeItem(at: temporary)
+        }
     }
 
     // MARK: - cookies
@@ -550,6 +755,33 @@ final class CloudSync: ObservableObject {
         var seen: Date
 
         var id: String { "\(name)\n\(domain)\n\(path)" }
+    }
+
+    struct CookieMark: Codable, Equatable {
+        var value: String
+        var seen: Date
+    }
+
+    /// A cookie this Mac has not changed keeps the date it already had, so a
+    /// newer value from the other Mac is not overwritten just because we
+    /// looked at ours. The first time both have it and they differ, the copy
+    /// already in iCloud wins — there is no earlier date to trust.
+    static func datedCrumbs(
+        _ local: [Crumb], remote: [Crumb], marks: [String: CookieMark]
+    ) -> [Crumb] {
+        let others = Dictionary(uniqueKeysWithValues: remote.map { ($0.id, $0) })
+        let now = Date()
+        return local.map { crumb in
+            var copy = crumb
+            if let mark = marks[crumb.id] {
+                copy.seen = mark.value == crumb.value ? mark.seen : now
+            } else if let other = others[crumb.id] {
+                copy.seen = other.value == crumb.value ? other.seen : .distantPast
+            } else {
+                copy.seen = now
+            }
+            return copy
+        }
     }
 
     static func mergeCrumbs(_ local: [Crumb], _ remote: [Crumb], gone: [String: Date]) -> [Crumb] {
@@ -600,7 +832,7 @@ final class CloudSync: ObservableObject {
         let stores = Dictionary(uniqueKeysWithValues: jars(browser))
         for id in ids {
             guard let store = stores[id], let remote = decode(Marked<[Crumb]>.self, cloud.appendingPathComponent("cookies/\(id).json")) else { continue }
-            let have = await cookies(of: store)
+            let have = datedCrumbs(await cookies(of: store), remote: remote.body, marks: stateMarks(for: id))
             let merged = mergeCrumbs(have, remote.body, gone: remote.gone)
             for crumb in merged where !have.contains(where: { $0.id == crumb.id && $0.value == crumb.value }) {
                 guard let cookie = HTTPCookie(properties: crumb.properties) else { continue }
@@ -610,20 +842,35 @@ final class CloudSync: ObservableObject {
             }
             var state = State.load(Store.folder)
             state.cookieSeen[id] = remote.updated
+            state.cookieMarks[id] = Dictionary(uniqueKeysWithValues: merged.map { ($0.id, CookieMark(value: $0.value, seen: $0.seen)) })
+            state.cookieIDs[id] = merged.map(\.id)
             state.save(Store.folder)
         }
+    }
+
+    private static func stateMarks(for jar: String) -> [String: CookieMark] {
+        State.load(Store.folder).cookieMarks[jar] ?? [:]
     }
 
     /// Called once a pass has the stores. Pushes the jars WebKit actually holds.
     static func pushCookies(cloud: URL, device: String) async {
         guard let browser = shared.browser, !Store.testing, shared.enabled else { return }
+        var state = State.load(Store.folder)
         for (id, store) in jars(browser) {
-            let have = await cookies(of: store)
             let remoteURL = cloud.appendingPathComponent("cookies/\(id).json")
             let remote = decode(Marked<[Crumb]>.self, remoteURL)
-            let merged = mergeCrumbs(have, remote?.body ?? [], gone: remote?.gone ?? [:])
-            publish(merged, gone: remote?.gone ?? [:], stamps: [:], device: device, url: remoteURL)
+            let have = datedCrumbs(
+                await cookies(of: store), remote: remote?.body ?? [], marks: state.cookieMarks[id] ?? [:]
+            )
+            var gone = remote?.gone ?? [:]
+            let ids = Set(have.map(\.id))
+            for known in state.cookieIDs[id] ?? [] where !ids.contains(known) { gone[known] = Date() }
+            let merged = mergeCrumbs(have, remote?.body ?? [], gone: gone)
+            publish(merged, gone: prune(gone), stamps: [:], device: device, url: remoteURL)
+            state.cookieMarks[id] = Dictionary(uniqueKeysWithValues: merged.map { ($0.id, CookieMark(value: $0.value, seen: $0.seen)) })
+            state.cookieIDs[id] = merged.map(\.id)
         }
+        state.save(Store.folder)
     }
 
     private static func cookies(of store: WKWebsiteDataStore) async -> [Crumb] {
@@ -637,6 +884,169 @@ final class CloudSync: ObservableObject {
                 expires: $0.expiresDate, secure: $0.isSecure, seen: now
             )
         }
+    }
+
+    // MARK: - passwords
+
+    struct LoginRow: Codable, Equatable {
+        var host: String
+        var user: String
+        var password: String
+        var changed: Date
+        var used: Date?
+        var clear: Bool
+
+        var id: String { host + "\u{1}" + user }
+    }
+
+    struct LoginBook: Codable, Equatable {
+        var rows: [LoginRow]
+        var gone: [String: Date]
+    }
+
+    /// Logins only one Mac has are kept. The same account with two passwords
+    /// keeps the one changed later. A deletion wins only when it is later
+    /// than the password it removes. Equal dates keep the first one seen,
+    /// which is this Mac's.
+    static func mergeLogins(_ local: [LoginRow], _ remote: [LoginRow], gone: [String: Date]) -> [LoginRow] {
+        var byID: [String: LoginRow] = [:]
+        for row in local + remote {
+            if let when = gone[row.id], when >= row.changed { continue }
+            if let have = byID[row.id], have.changed >= row.changed { continue }
+            byID[row.id] = row
+        }
+        return byID.values.sorted { $0.id < $1.id }
+    }
+
+    private struct PasswordResult {
+        var changed = false
+        var waiting = false
+    }
+
+    /// The file in iCloud Drive is ciphertext. The key is one synchronizable
+    /// keychain item. A Mac that can see the file but not yet the key waits,
+    /// and does not write a second key over the first.
+    private static func mergePasswords(cloud: URL, state: inout State) -> PasswordResult {
+        guard !Store.testing else { return PasswordResult() }
+        let keyURL = cloud.appendingPathComponent("logins.key")
+        let blobURL = cloud.appendingPathComponent("logins.bin")
+        let cloudID = (try? String(contentsOf: keyURL, encoding: .utf8))?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        var result = PasswordResult()
+        guard let key = SyncKey.matching(cloudID, cloudHasFile: FileManager.default.fileExists(atPath: blobURL.path)) else {
+            result.waiting = cloudID != nil || FileManager.default.fileExists(atPath: blobURL.path)
+            return result
+        }
+        if cloudID != key.id {
+            try? key.id.write(to: keyURL, atomically: true, encoding: .utf8)
+            let seen = (try? String(contentsOf: keyURL, encoding: .utf8))?
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            if seen != key.id {
+                result.waiting = true
+                return result
+            }
+        }
+        let remote = (try? Data(contentsOf: blobURL)).flatMap { SyncKey.open($0, key: key.bytes) }
+        if FileManager.default.fileExists(atPath: blobURL.path), remote == nil {
+            result.waiting = true
+            return result
+        }
+        let localRows = Vault.all().map {
+            LoginRow(host: $0.host, user: $0.user, password: $0.password, changed: $0.changed, used: $0.used, clear: $0.clear)
+        }
+        var gone = remote?.gone ?? [:]
+        let localIDs = Set(localRows.map(\.id))
+        if !state.loginIDs.isEmpty {
+            for id in state.loginIDs where !localIDs.contains(id) { gone[id] = Date() }
+        }
+        let merged = mergeLogins(localRows, remote?.rows ?? [], gone: gone)
+        let mergedIDs = Set(merged.map(\.id))
+        let byLocal = Dictionary(uniqueKeysWithValues: localRows.map { ($0.id, $0) })
+        for row in merged {
+            if let have = byLocal[row.id],
+               have.password == row.password, have.changed == row.changed, have.clear == row.clear, have.used == row.used {
+                continue
+            }
+            let wrote = Vault.save(
+                host: row.host, user: row.user, password: row.password,
+                used: row.used, clear: row.clear, changed: row.changed, keepChanged: true, quiet: true
+            )
+            if wrote { result.changed = true }
+        }
+        for row in localRows where !mergedIDs.contains(row.id) {
+            Vault.forget(host: row.host, user: row.user, quiet: true)
+            result.changed = true
+        }
+        let book = LoginBook(rows: merged, gone: prune(gone))
+        if remote != book, let sealed = SyncKey.seal(book, key: key.bytes) {
+            put(sealed, blobURL)
+        }
+        state.loginIDs = merged.map(\.id)
+        return result
+    }
+
+    private struct SyncKey {
+        var id: String
+        var bytes: SymmetricKey
+
+        static func matching(_ cloudID: String?, cloudHasFile: Bool) -> SyncKey? {
+            if let have = load() {
+                if let cloudID, cloudID != have.id { return nil }
+                return have
+            }
+            if cloudID != nil || cloudHasFile { return nil }
+            return make()
+        }
+
+        private static func load() -> SyncKey? {
+            var out: CFTypeRef?
+            let status = SecItemCopyMatching([
+                kSecClass as String: kSecClassGenericPassword,
+                kSecAttrService as String: service,
+                kSecAttrAccount as String: account,
+                kSecAttrSynchronizable as String: kSecAttrSynchronizableAny,
+                kSecReturnData as String: true,
+                kSecReturnAttributes as String: true,
+                kSecMatchLimit as String: kSecMatchLimitOne,
+            ] as CFDictionary, &out)
+            guard status == errSecSuccess, let row = out as? [String: Any],
+                  let data = row[kSecValueData as String] as? Data, data.count == 32,
+                  let id = row[kSecAttrComment as String] as? String, !id.isEmpty
+            else { return nil }
+            return SyncKey(id: id, bytes: SymmetricKey(data: data))
+        }
+
+        private static func make() -> SyncKey? {
+            let key = SymmetricKey(size: .bits256)
+            let id = UUID().uuidString
+            let data = key.withUnsafeBytes { Data($0) }
+            let added = SecItemAdd([
+                kSecClass as String: kSecClassGenericPassword,
+                kSecAttrService as String: service,
+                kSecAttrAccount as String: account,
+                kSecAttrComment as String: id,
+                kSecValueData as String: data,
+                kSecAttrSynchronizable as String: kCFBooleanTrue,
+                kSecAttrAccessible as String: kSecAttrAccessibleWhenUnlocked,
+                kSecAttrLabel as String: "Search by Noah",
+            ] as CFDictionary, nil) == errSecSuccess
+            return added ? SyncKey(id: id, bytes: key) : nil
+        }
+
+        static func seal(_ book: LoginBook, key: SymmetricKey) -> Data? {
+            guard let data = try? JSONEncoder().encode(book),
+                  let box = try? AES.GCM.seal(data, using: key) else { return nil }
+            return box.combined
+        }
+
+        static func open(_ data: Data, key: SymmetricKey) -> LoginBook? {
+            guard let box = try? AES.GCM.SealedBox(combined: data),
+                  let clear = try? AES.GCM.open(box, using: key) else { return nil }
+            return try? JSONDecoder().decode(LoginBook.self, from: clear)
+        }
+
+        private static let service = "com.noahveenstra.search.sync"
+        private static let account = "sync-key"
     }
 
     // MARK: - files
@@ -665,6 +1075,69 @@ final class CloudSync: ObservableObject {
         var extensionHash = ""
         var extensionSeen = Date.distantPast
         var cookieSeen: [String: Date] = [:]
+        var cookieMarks: [String: [String: CookieMark]] = [:]
+        var cookieIDs: [String: [String]] = [:]
+        var loginIDs: [String] = []
+        var neverKeys: [String] = []
+        var neverStamps: [String: Date] = [:]
+        var extensionIDs: [String] = []
+        var extensionFolderHashes: [String: String] = [:]
+        var extensionStamps: [String: Date] = [:]
+        var extensionRecords: [String: String] = [:]
+
+        enum CodingKeys: String, CodingKey {
+            case historyKeys, bookmarkIDs, bookmarkHashes, bookmarkStamps, spaceIDs, hiddenKeys, hashes
+            case extensionHash, extensionSeen, cookieSeen, cookieMarks, cookieIDs, loginIDs
+            case neverKeys, neverStamps, extensionIDs, extensionFolderHashes, extensionStamps, extensionRecords
+        }
+
+        init() {}
+
+        init(from decoder: Decoder) throws {
+            let c = try decoder.container(keyedBy: CodingKeys.self)
+            historyKeys = try c.decodeIfPresent([String].self, forKey: .historyKeys) ?? []
+            bookmarkIDs = try c.decodeIfPresent([String].self, forKey: .bookmarkIDs) ?? []
+            bookmarkHashes = try c.decodeIfPresent([String: String].self, forKey: .bookmarkHashes) ?? [:]
+            bookmarkStamps = try c.decodeIfPresent([String: Date].self, forKey: .bookmarkStamps) ?? [:]
+            spaceIDs = try c.decodeIfPresent([String].self, forKey: .spaceIDs) ?? []
+            hiddenKeys = try c.decodeIfPresent([String].self, forKey: .hiddenKeys) ?? []
+            hashes = try c.decodeIfPresent([String: String].self, forKey: .hashes) ?? [:]
+            extensionHash = try c.decodeIfPresent(String.self, forKey: .extensionHash) ?? ""
+            extensionSeen = try c.decodeIfPresent(Date.self, forKey: .extensionSeen) ?? .distantPast
+            cookieSeen = try c.decodeIfPresent([String: Date].self, forKey: .cookieSeen) ?? [:]
+            cookieMarks = try c.decodeIfPresent([String: [String: CookieMark]].self, forKey: .cookieMarks) ?? [:]
+            cookieIDs = try c.decodeIfPresent([String: [String]].self, forKey: .cookieIDs) ?? [:]
+            loginIDs = try c.decodeIfPresent([String].self, forKey: .loginIDs) ?? []
+            neverKeys = try c.decodeIfPresent([String].self, forKey: .neverKeys) ?? []
+            neverStamps = try c.decodeIfPresent([String: Date].self, forKey: .neverStamps) ?? [:]
+            extensionIDs = try c.decodeIfPresent([String].self, forKey: .extensionIDs) ?? []
+            extensionFolderHashes = try c.decodeIfPresent([String: String].self, forKey: .extensionFolderHashes) ?? [:]
+            extensionStamps = try c.decodeIfPresent([String: Date].self, forKey: .extensionStamps) ?? [:]
+            extensionRecords = try c.decodeIfPresent([String: String].self, forKey: .extensionRecords) ?? [:]
+        }
+
+        func encode(to encoder: Encoder) throws {
+            var c = encoder.container(keyedBy: CodingKeys.self)
+            try c.encode(historyKeys, forKey: .historyKeys)
+            try c.encode(bookmarkIDs, forKey: .bookmarkIDs)
+            try c.encode(bookmarkHashes, forKey: .bookmarkHashes)
+            try c.encode(bookmarkStamps, forKey: .bookmarkStamps)
+            try c.encode(spaceIDs, forKey: .spaceIDs)
+            try c.encode(hiddenKeys, forKey: .hiddenKeys)
+            try c.encode(hashes, forKey: .hashes)
+            try c.encode(extensionHash, forKey: .extensionHash)
+            try c.encode(extensionSeen, forKey: .extensionSeen)
+            try c.encode(cookieSeen, forKey: .cookieSeen)
+            try c.encode(cookieMarks, forKey: .cookieMarks)
+            try c.encode(cookieIDs, forKey: .cookieIDs)
+            try c.encode(loginIDs, forKey: .loginIDs)
+            try c.encode(neverKeys, forKey: .neverKeys)
+            try c.encode(neverStamps, forKey: .neverStamps)
+            try c.encode(extensionIDs, forKey: .extensionIDs)
+            try c.encode(extensionFolderHashes, forKey: .extensionFolderHashes)
+            try c.encode(extensionStamps, forKey: .extensionStamps)
+            try c.encode(extensionRecords, forKey: .extensionRecords)
+        }
 
         @MainActor
         static func load(_ folder: URL) -> State {
@@ -792,6 +1265,39 @@ final class CloudSync: ObservableObject {
         check(winningSession([same], local: shape, localUpdated: early) == nil, "the same tabs are not handed back")
         let other = RemoteSession(updated: later, tabs: [Session.Entry(url: "https://other.example/", title: "O", pin: nil, name: nil)], active: 0)
         check(winningSession([other], local: shape, localUpdated: early)?.tabs.first?.url == "https://other.example/", "a newer row replaces this one")
+
+        let olderLogin = LoginRow(host: "a.example", user: "one", password: "old", changed: early, used: nil, clear: false)
+        let newerLogin = LoginRow(host: "a.example", user: "one", password: "new", changed: later, used: nil, clear: false)
+        let extra = LoginRow(host: "b.example", user: "two", password: "only-there", changed: early, used: nil, clear: false)
+        let logins = mergeLogins([olderLogin], [newerLogin, extra], gone: [:])
+        check(logins.count == 2 && logins.contains(where: { $0.password == "new" }) && logins.contains(where: { $0.host == "b.example" }), "the later password wins and a login only one Mac has is kept")
+        let forgotten = mergeLogins([newerLogin], [olderLogin], gone: [newerLogin.id: later])
+        check(forgotten.isEmpty, "a password deleted after it changed stays deleted")
+
+        let kept = mergeNever(["a"], ["b"], localAt: ["a": early], remoteAt: ["b": early], gone: [:])
+        check(kept == ["a", "b"], "sites told never-ask on either Mac are kept")
+        let removed = mergeNever(["a"], ["a"], localAt: ["a": early], remoteAt: ["a": early], gone: ["a": later])
+        check(removed.isEmpty, "a later never-ask removal wins")
+
+        let localCrumb = Crumb(name: "sid", value: "ours", domain: "a.example", path: "/", expires: nil, secure: true, seen: early)
+        let remoteCrumb = Crumb(name: "sid", value: "theirs", domain: "a.example", path: "/", expires: nil, secure: true, seen: later)
+        let dated = datedCrumbs([localCrumb], remote: [remoteCrumb], marks: [:])
+        let crumbMerged = mergeCrumbs(dated, [remoteCrumb], gone: [:])
+        check(crumbMerged.first?.value == "theirs", "a first sync does not let this Mac's cookie overwrite the one already in iCloud")
+
+        let noteEarly = ExtensionNote(hash: "1", updated: early, record: nil)
+        let noteLate = ExtensionNote(hash: "2", updated: later, record: nil)
+        let onlyHere = ExtensionNote(hash: "3", updated: early, record: nil)
+        let picked = chooseExtensions(local: ["both": noteEarly, "here": onlyHere], remote: ["both": noteLate], gone: [:])
+        check(picked["both"] == .remote && picked["here"] == .local, "a newer extension wins and one only this Mac has is kept")
+
+        let secret = SymmetricKey(size: .bits256)
+        let book = LoginBook(rows: [extra], gone: [:])
+        if let sealed = SyncKey.seal(book, key: secret), let opened = SyncKey.open(sealed, key: secret) {
+            check(opened == book, "a password book seals and opens")
+        } else {
+            check(false, "a password book seals and opens")
+        }
 
         let root = FileManager.default.temporaryDirectory.appendingPathComponent("search-sync-\(UUID().uuidString)", isDirectory: true)
         let macA = root.appendingPathComponent("a", isDirectory: true)
